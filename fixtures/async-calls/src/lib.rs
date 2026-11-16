@@ -202,4 +202,44 @@ pub async fn use_shared_resource(options: SharedResourceOptions) -> Result<(), A
     acquire_with_timeout(options).await
 }
 
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum AsyncParserError {
+    #[error("invalid integer")]
+    InvalidInteger,
+    #[error("unexpected callback error")]
+    Unexpected,
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for AsyncParserError {
+    fn from(_: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Unexpected
+    }
+}
+
+#[uniffi::export(with_foreign)]
+#[async_trait::async_trait]
+pub trait AsyncParser: Send + Sync {
+    async fn stringify(&self, value: i32) -> String;
+    async fn parse(&self, value: String) -> Result<i32, AsyncParserError>;
+    async fn wait(&self);
+}
+
+#[uniffi::export]
+pub async fn stringify_using_parser(parser: Arc<dyn AsyncParser>, value: i32) -> String {
+    parser.stringify(value).await
+}
+
+#[uniffi::export]
+pub async fn parse_using_parser(
+    parser: Arc<dyn AsyncParser>,
+    value: String,
+) -> Result<i32, AsyncParserError> {
+    parser.parse(value).await
+}
+
+#[uniffi::export]
+pub async fn wait_using_parser(parser: Arc<dyn AsyncParser>) {
+    parser.wait().await
+}
+
 uniffi::include_scaffolding!("async-calls");

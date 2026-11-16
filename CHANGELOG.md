@@ -10,7 +10,7 @@
 - Core: Support `#[uniffi(default)]` without a literal using C++ value initialization (`{}`)
 - Core: Fix optional enum default values rendering with the wrong type
 - Core: Fix duplicate type definitions when a record or enum references the same type more than once
-- Core: Async functions, constructors and methods are omitted with a warning instead of aborting generation; async callback interfaces are still unsupported
+- Core: Support async functions, constructors, methods, and callback interfaces with C++17 futures, cancellation, continuations, and one shared control executor
 
 #### v0.9.0+v0.29.4
 

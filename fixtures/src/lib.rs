@@ -1,5 +1,6 @@
 mod uniffi_fixtures {
     arithmetical::uniffi_reexport_scaffolding!();
+    uniffi_async_api_client::uniffi_reexport_scaffolding!();
     uniffi_callbacks::uniffi_reexport_scaffolding!();
     custom_types::uniffi_reexport_scaffolding!();
     uniffi_geometry::uniffi_reexport_scaffolding!();

@@ -1,92 +1,172 @@
 constexpr int8_t UNIFFI_RUST_FUTURE_POLL_READY = 0;
 constexpr int8_t UNIFFI_RUST_FUTURE_POLL_WAKE = 1;
 
-template <typename Free>
-class RustFutureHandleGuard {
-public:
-    // Own the Rust handle until all potentially-throwing C++ wrappers exist.
-    RustFutureHandleGuard(uint64_t handle, Free &free) noexcept:
-        handle_(handle), free_(free) {}
+// Coordinates completion and Rust-driven cancellation for a C++ implementation of an async
+// callback-interface method.  Dropping the Rust future wins the completion race, invokes the
+// operation's cancel action, and sends a cancelled result exactly once.
+class ForeignFutureTaskState {
+  public:
+    void start(const std::shared_ptr<ForeignFutureTaskState> &self) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto weak = std::weak_ptr<ForeignFutureTaskState>(self);
+        operation_id_ = ::uniffi::detail::default_async_dispatcher().track([weak] {
+            if (auto state = weak.lock()) {
+                ::uniffi::detail::dispatch_async([state] { state->cancel(); });
+            }
+        });
+    }
+
+    bool finish() noexcept {
+        std::function<void()> cancel;
+        std::function<void()> complete_cancelled;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (finished_) {
+                return false;
+            }
+            finished_ = true;
+            cancel = std::move(cancel_);
+            complete_cancelled = std::move(complete_cancelled_);
+        }
+        ::uniffi::detail::default_async_dispatcher().untrack(operation_id_);
+        // Releasing captures can destroy application objects; do it outside the state mutex.
+        return true;
+    }
+
+    void set_cancel(std::function<void()> cancel) noexcept {
+        std::function<void()> cancel_now;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (cancel_requested_) {
+                cancel_now = std::move(cancel);
+            } else if (!finished_) {
+                cancel_ = std::move(cancel);
+            }
+        }
+        if (cancel_now) {
+            try {
+                cancel_now();
+            } catch (...) {
+            }
+        }
+    }
+
+    void set_cancel_completion(std::function<void()> complete_cancelled) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        complete_cancelled_ = std::move(complete_cancelled);
+    }
+
+    void cancel() noexcept {
+        std::function<void()> cancel;
+        std::function<void()> complete_cancelled;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (finished_) {
+                return;
+            }
+            finished_ = true;
+            cancel_requested_ = true;
+            cancel = std::move(cancel_);
+            complete_cancelled = std::move(complete_cancelled_);
+        }
+        if (cancel) {
+            try {
+                cancel();
+            } catch (...) {
+            }
+        }
+        if (complete_cancelled) {
+            complete_cancelled();
+        }
+        ::uniffi::detail::default_async_dispatcher().untrack(operation_id_);
+    }
+
+  private:
+    std::mutex mutex_;
+    uint64_t operation_id_ = 0;
+    bool finished_ = false;
+    bool cancel_requested_ = false;
+    std::function<void()> cancel_;
+    std::function<void()> complete_cancelled_;
+};
+
+inline uint64_t foreign_future_handle(const std::shared_ptr<ForeignFutureTaskState> &state) {
+    return reinterpret_cast<uint64_t>(new std::shared_ptr<ForeignFutureTaskState>(state));
+}
+
+inline void foreign_future_drop(uint64_t handle) noexcept {
+    auto state = std::unique_ptr<std::shared_ptr<ForeignFutureTaskState>>(
+        reinterpret_cast<std::shared_ptr<ForeignFutureTaskState> *>(handle));
+    auto task_state = *state;
+    if (!::uniffi::detail::dispatch_async([task_state] { task_state->cancel(); })) {
+        task_state->cancel();
+    }
+}
+
+template <typename Free> class RustFutureHandleGuard {
+  public:
+    RustFutureHandleGuard(uint64_t handle, Free &free) noexcept : handle_(handle), free_(free) {}
 
     RustFutureHandleGuard(const RustFutureHandleGuard &) = delete;
     RustFutureHandleGuard &operator=(const RustFutureHandleGuard &) = delete;
 
     ~RustFutureHandleGuard() {
         if (active_) {
-            try {
-                free_(handle_);
-            } catch (...) {
-            }
+            free_(handle_);
         }
     }
 
-    void release() noexcept {
-        active_ = false;
-    }
+    void release() noexcept { active_ = false; }
 
-private:
+  private:
     uint64_t handle_;
     Free &free_;
     bool active_ = true;
 };
 
-template <typename T, typename Poll, typename Cancel, typename Complete, typename Free, typename Lift, typename ErrorHandler>
-class RustFutureState: public std::enable_shared_from_this<RustFutureState<T, Poll, Cancel, Complete, Free, Lift, ErrorHandler>> {
-public:
-    RustFutureState(
-        uint64_t handle,
-        Poll poll,
-        Cancel cancel,
-        Complete complete,
-        Free free,
-        Lift lift,
-        ErrorHandler error_handler
-    ):
-        handle_(handle),
-        poll_(std::move(poll)),
-        cancel_(std::move(cancel)),
-        complete_(std::move(complete)),
-        free_(std::move(free)),
-        lift_(std::move(lift)),
-        error_handler_(std::move(error_handler)) {}
-
-    std::future<T> get_future() {
-        return promise_.get_future();
+template <typename T, typename Poll, typename Cancel, typename Complete, typename Free,
+          typename Lift, typename ErrorHandler>
+class RustFutureState : public std::enable_shared_from_this<
+                            RustFutureState<T, Poll, Cancel, Complete, Free, Lift, ErrorHandler>> {
+  public:
+    RustFutureState(uint64_t handle, Poll poll, Cancel cancel, Complete complete, Free free,
+                    Lift lift, ErrorHandler error_handler,
+                    std::shared_ptr<::uniffi::detail::FutureCompletionState<T>> completion_state)
+        : handle_(handle), poll_(std::move(poll)), cancel_(std::move(cancel)),
+          complete_(std::move(complete)), free_(std::move(free)), lift_(std::move(lift)),
+          error_handler_(std::move(error_handler)), completion_state_(std::move(completion_state)) {
     }
 
-    void start() noexcept {
-        try {
-            auto state = this->shared_from_this();
-            std::thread([state = std::move(state)]() {
-                state->run();
-            }).detach();
-        } catch (...) {
-            auto error = std::current_exception();
-            free_(handle_);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                finished_ = true;
-            }
-            try {
-                promise_.set_exception(std::move(error));
-            } catch (...) {
-            }
+    void start() {
+        const auto self = this->shared_from_this();
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            operation_id_ =
+                ::uniffi::detail::default_async_dispatcher().track([self] { self->cancel(); });
         }
+        if (!operation_id_) {
+            free_(handle_);
+            completion_state_->complete(::uniffi::FutureResult<T>(
+                std::make_exception_ptr(::uniffi::AsyncDispatcherError())));
+            return;
+        }
+        request_drive();
     }
 
     void cancel() noexcept {
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (finished_) {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (terminal_) {
                 return;
             }
             cancel_requested_ = true;
         }
-        wake_.notify_one();
+        request_drive();
     }
 
-private:
-    enum class Work {
+  private:
+    enum class Action {
+        None,
         PollFuture,
         CancelFuture,
         CompleteFuture,
@@ -95,221 +175,219 @@ private:
     using State = RustFutureState<T, Poll, Cancel, Complete, Free, Lift, ErrorHandler>;
 
     static void continuation(uint64_t callback_data, int8_t poll_result) noexcept {
-        auto callback_state = std::unique_ptr<std::shared_ptr<State>>(
-            reinterpret_cast<std::shared_ptr<State> *>(callback_data)
-        );
-        (*callback_state)->resume(poll_result);
+        // The active-operation registry owns the state until READY has been consumed and freed.
+        auto state = reinterpret_cast<State *>(callback_data)->shared_from_this();
+        state->on_continuation(poll_result);
     }
 
-    void resume(int8_t poll_result) noexcept {
+    void on_continuation(int8_t poll_result) noexcept {
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (finished_) {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (terminal_) {
                 return;
             }
-
+            poll_outstanding_ = false;
             if (poll_result == UNIFFI_RUST_FUTURE_POLL_READY) {
                 ready_ = true;
             } else if (poll_result == UNIFFI_RUST_FUTURE_POLL_WAKE) {
                 poll_requested_ = true;
             } else {
                 failure_ = std::make_exception_ptr(
-                    std::runtime_error("Unexpected UniFFI Rust future poll result")
-                );
+                    std::runtime_error("Unexpected UniFFI Rust future poll result"));
                 cancel_requested_ = true;
             }
         }
-        wake_.notify_one();
+        request_drive();
     }
 
-    void run() noexcept {
-        for (;;) {
-            Work work;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                wake_.wait(lock, [this]() {
-                    return finished_ || ready_ || poll_requested_ ||
-                        (cancel_requested_ && !cancel_sent_);
-                });
-
-                if (finished_) {
-                    return;
-                }
-
-                if (cancel_requested_ && !cancel_sent_) {
-                    cancel_sent_ = true;
-                    work = Work::CancelFuture;
-                } else if (ready_) {
-                    ready_ = false;
-                    work = Work::CompleteFuture;
-                } else {
-                    poll_requested_ = false;
-                    work = Work::PollFuture;
-                }
+    void request_drive() noexcept {
+        std::shared_ptr<State> state;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (terminal_ || driving_ || scheduled_) {
+                return;
             }
+            scheduled_ = true;
+            state = this->shared_from_this();
+        }
 
-            if (work == Work::PollFuture) {
+        if (!::uniffi::detail::dispatch_async([state] { state->drive(); })) {
+            // Active operations keep the executor alive until their handles have been released.
+            std::terminate();
+        }
+    }
+
+    Action next_action() noexcept {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (terminal_) {
+            return Action::None;
+        }
+        if (ready_) {
+            terminal_ = true;
+            return Action::CompleteFuture;
+        }
+        if (cancel_requested_ && !cancel_sent_) {
+            cancel_sent_ = true;
+            return Action::CancelFuture;
+        }
+        if (poll_requested_ && !poll_outstanding_) {
+            poll_requested_ = false;
+            poll_outstanding_ = true;
+            return Action::PollFuture;
+        }
+        return Action::None;
+    }
+
+    void drive() noexcept {
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            scheduled_ = false;
+            if (terminal_ || driving_) {
+                return;
+            }
+            driving_ = true;
+        }
+
+        // Bound each turn so a rapidly waking future cannot starve other calls.
+        for (unsigned turn = 0; turn < 64; ++turn) {
+            switch (next_action()) {
+            case Action::PollFuture:
                 poll();
-            } else if (work == Work::CancelFuture) {
+                break;
+            case Action::CancelFuture:
                 cancel_rust_future();
-            } else {
-                complete();
+                break;
+            case Action::CompleteFuture:
+                complete_and_free();
+                {
+                    std::lock_guard<std::mutex> guard(mutex_);
+                    driving_ = false;
+                }
+                return;
+            case Action::None: {
+                std::lock_guard<std::mutex> guard(mutex_);
+                // A continuation can arrive after next_action() releases the mutex but before
+                // this block acquires it.  It observes driving_ and deliberately does not enqueue
+                // another driver, so re-check the state before yielding ownership.
+                if (!terminal_ && (ready_ || (cancel_requested_ && !cancel_sent_) ||
+                                   (poll_requested_ && !poll_outstanding_))) {
+                    continue;
+                }
+                driving_ = false;
+            }
                 return;
             }
         }
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            driving_ = false;
+        }
+        request_drive();
     }
 
     void poll() noexcept {
-        std::shared_ptr<State> *callback_state = nullptr;
-        try {
-            callback_state = new std::shared_ptr<State>(this->shared_from_this());
-            poll_(handle_, &RustFutureState::continuation, reinterpret_cast<uint64_t>(callback_state));
-        } catch (...) {
-            delete callback_state;
-            fail(std::current_exception());
-        }
+        // UniFFI invokes exactly one continuation per poll. Reuse the state's address instead of
+        // allocating callback userdata on every wake; the registry retains it until completion.
+        poll_(handle_, &RustFutureState::continuation, reinterpret_cast<uint64_t>(this));
     }
 
     void cancel_rust_future() noexcept {
-        try {
-            cancel_(handle_);
-        } catch (...) {
-            fail(std::current_exception());
+        cancel_(handle_);
+        // If cancellation happened before the first poll there is no continuation to wake.  Polling
+        // the cancelled Rust future yields READY immediately and keeps us on the documented path.
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (!poll_outstanding_ && !ready_) {
+            poll_requested_ = true;
         }
-
-        // Cancellation makes a Rust future ready even if it had not yet been polled.
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            ready_ = true;
-        }
-        wake_.notify_one();
     }
 
-    void fail(std::exception_ptr error) noexcept {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!failure_) {
-                failure_ = std::move(error);
-            }
-            cancel_requested_ = true;
-        }
-        wake_.notify_one();
-    }
-
-    void complete() noexcept {
-        bool cancelled;
-        std::exception_ptr failure;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cancelled = cancel_requested_;
-            failure = failure_;
-        }
+    void complete_and_free() noexcept {
+        std::exception_ptr result_error;
+        using StoredResult =
+            std::conditional_t<std::is_void_v<T>, std::monostate, std::optional<T>>;
+        StoredResult result_value{};
 
         try {
-            RustCallStatus status = { 0 };
+            RustCallStatus status{};
             if constexpr (std::is_void_v<T>) {
                 complete_(handle_, &status);
-                if (failure || cancelled) {
-                    try {
-                        check_rust_call(status, error_handler_);
-                    } catch (...) {
-                    }
-                    set_terminal_exception(failure, cancelled);
-                } else {
-                    check_rust_call(status, error_handler_);
-                    promise_.set_value();
-                }
+                check_rust_call(status, error_handler_);
             } else {
                 auto value = complete_(handle_, &status);
-                if (failure || cancelled) {
-                    try {
-                        check_rust_call(status, error_handler_);
-                        static_cast<void>(lift_(value));
-                    } catch (...) {
-                    }
-                    set_terminal_exception(failure, cancelled);
-                } else {
-                    check_rust_call(status, error_handler_);
-                    promise_.set_value(lift_(value));
-                }
+                check_rust_call(status, error_handler_);
+                result_value.emplace(lift_(value));
             }
         } catch (...) {
-            try {
-                promise_.set_exception(std::current_exception());
-            } catch (...) {
-            }
+            result_error = std::current_exception();
+        }
+
+        std::exception_ptr protocol_failure;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            protocol_failure = failure_;
         }
 
         free_(handle_);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            finished_ = true;
-        }
-    }
+        ::uniffi::detail::default_async_dispatcher().untrack(operation_id_);
 
-    void set_terminal_exception(const std::exception_ptr &failure, bool cancelled) noexcept {
-        try {
-            if (failure) {
-                promise_.set_exception(failure);
-            } else if (cancelled) {
-                promise_.set_exception(std::make_exception_ptr(::uniffi::AsyncCancelledError()));
-            }
-        } catch (...) {
+        if (protocol_failure) {
+            completion_state_->complete(::uniffi::FutureResult<T>(protocol_failure));
+        } else if (result_error) {
+            completion_state_->complete(::uniffi::FutureResult<T>(result_error));
+        } else if constexpr (std::is_void_v<T>) {
+            completion_state_->complete(::uniffi::FutureResult<void>());
+        } else {
+            completion_state_->complete(::uniffi::FutureResult<T>(std::move(*result_value)));
         }
     }
 
     uint64_t handle_;
+    uint64_t operation_id_ = 0;
     Poll poll_;
     Cancel cancel_;
     Complete complete_;
     Free free_;
     Lift lift_;
     ErrorHandler error_handler_;
-    std::promise<T> promise_;
+    std::shared_ptr<::uniffi::detail::FutureCompletionState<T>> completion_state_;
     std::mutex mutex_;
-    std::condition_variable wake_;
     std::exception_ptr failure_;
     bool poll_requested_ = true;
+    bool poll_outstanding_ = false;
     bool cancel_requested_ = false;
     bool cancel_sent_ = false;
     bool ready_ = false;
-    bool finished_ = false;
+    bool scheduled_ = false;
+    bool driving_ = false;
+    bool terminal_ = false;
 };
 
-template <typename T, typename RustFuture, typename Poll, typename Cancel, typename Complete, typename Free, typename Lift, typename ErrorHandler>
-Future<T> rust_call_async(
-    RustFuture rust_future,
-    Poll poll,
-    Cancel cancel,
-    Complete complete,
-    Free free,
-    Lift lift,
-    ErrorHandler error_handler
-) {
+template <typename T, typename RustFuture, typename Poll, typename Cancel, typename Complete,
+          typename Free, typename Lift, typename ErrorHandler>
+Future<T> rust_call_async(RustFuture rust_future, Poll poll, Cancel cancel, Complete complete,
+                          Free free, Lift lift, ErrorHandler error_handler) {
     initialize();
+    auto completion_state = std::make_shared<::uniffi::detail::FutureCompletionState<T>>();
+    if (!::uniffi::detail::begin_async_call()) {
+        completion_state->complete(
+            ::uniffi::FutureResult<T>(std::make_exception_ptr(::uniffi::AsyncDispatcherError())));
+        return Future<T>(std::move(completion_state), nullptr);
+    }
+
     const auto handle = rust_future();
     RustFutureHandleGuard<Free> handle_guard(handle, free);
     using State = RustFutureState<T, Poll, Cancel, Complete, Free, Lift, ErrorHandler>;
 
-    auto state = std::make_shared<State>(
-        handle,
-        std::move(poll),
-        std::move(cancel),
-        std::move(complete),
-        // Keep the guard's cleanup callable valid until ownership transfers.
-        free,
-        std::move(lift),
-        std::move(error_handler)
-    );
-    auto future = state->get_future();
-    Future<T> result(std::move(future), [weak_state = std::weak_ptr<State>(state)]() {
+    auto state =
+        std::make_shared<State>(handle, std::move(poll), std::move(cancel), std::move(complete),
+                                free, std::move(lift), std::move(error_handler), completion_state);
+    Future<T> result(completion_state, [weak_state = std::weak_ptr<State>(state)] {
         if (auto state = weak_state.lock()) {
             state->cancel();
         }
     });
 
-    // start() assumes cleanup responsibility, including thread-start failure.
-    handle_guard.release();
     state->start();
+    handle_guard.release();
     return result;
 }

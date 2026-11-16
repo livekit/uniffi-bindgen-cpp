@@ -8,6 +8,7 @@ crate-type = ["cdylib", "lib", "staticlib"]
 
 [dependencies]
 uniffi-example-arithmetic = { git = "https://github.com/mozilla/uniffi-rs.git", tag = "v0.31.2" }
+uniffi-example-async-api-client = { git = "https://github.com/mozilla/uniffi-rs.git", tag = "v0.31.2" }
 uniffi-example-callbacks = { git = "https://github.com/mozilla/uniffi-rs.git", tag = "v0.31.2" }
 uniffi-example-custom-types = { git = "https://github.com/mozilla/uniffi-rs.git", tag = "v0.31.2" }
 uniffi-example-geometry = { git = "https://github.com/mozilla/uniffi-rs.git", tag = "v0.31.2" }

@@ -1,9 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <future>
@@ -99,6 +101,7 @@ typedef {{ type_name }} {{ name }};
 {%- let vtable = cbi.vtable() %}
 {%- let vtable_methods = cbi.vtable_methods() %}
 {%- let interface_docstring = cbi.docstring() %}
+{%- let interface_base_name = "" %}
 {% include "callback.hpp" %}
 {%- when Type::Object { module_path, name, imp } %}
 {% include "obj.hpp" %}
