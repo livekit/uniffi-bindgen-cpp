@@ -4,10 +4,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# These fixture tests use assert-based checks, including in Release CI.
 if (MSVC)
-    add_compile_options(/permissive-)
+    add_compile_options(/permissive- /UNDEBUG)
 else()
-    add_compile_options(-pedantic-errors)
+    add_compile_options(-pedantic-errors -UNDEBUG)
 endif()
 
 include(CTest)
@@ -121,3 +122,5 @@ add_custom_target(bindings ALL
     WORKING_DIRECTORY ${BINDINGS_BUILD_DIR}
     COMMENT "Generating bindings"
 )
+
+set_tests_properties(async_api_client-test PROPERTIES TIMEOUT 45)

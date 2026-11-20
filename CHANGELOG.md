@@ -1,6 +1,7 @@
 #### v0.10.0+v0.31.2
 
 ----
+- Tests: Expand coverage of the upstream async API client example
 - Core: Update bindgen to UniFFI v0.31.2
 - Core: Objects are passed across the FFI as `uint64_t` handles instead of raw pointers
 - Core: Trait interfaces distinguish Rust- and C++-implemented objects when lifting and lowering, and implement the new `uniffi_clone` vtable entry

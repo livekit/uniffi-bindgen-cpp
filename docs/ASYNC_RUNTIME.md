@@ -1,44 +1,5 @@
 # C++17 async runtime
 
-## Branch and migration
-
-`livekit/dev-async-support` starts at `livekit/dev` (`e558880`, UniFFI 0.31.2 / C++17).
-The original Rust-to-C++ async commits (`9d86abe`, `c4ad947`) were cherry-picked, then the async
-work from stash `3e98bc0` was copied onto that base. All original branches and stashes remain intact.
-The two older stashes concern non-async generator work; they were inspected, not applied wholesale.
-IDE-only changes from the async stash were left out.
-
-Nothing was pushed, and neither SDK's production generator pin or checked-out sources were changed.
-
-## Review of the recovered design
-
-The original PR allocated a detached thread for every call. The recovered stash had already moved
-to a shared dispatcher and introduced callback-based foreign futures and continuations. It was the
-better starting point, but needed a consistent ownership and execution model:
-
-- A rejecting custom dispatcher started a second fallback executor. This created two control paths
-  and made cleanup depend on executor rejection policy. The implementation now has one owned control
-  executor, with no replaceable dispatcher or fallback worker.
-- Shutdown required every caller to make every future terminal first. The executor now registers
-  active Rust and foreign operations, rejects new work at shutdown, cancels registered operations,
-  drains completions and continuations, and joins its worker. Concurrent application callers and
-  repeated shutdown calls are covered by tests.
-- Foreign method startup could invoke user code inside Rust polling. Startup, cancellation, and
-  completion delivery are now deferred onto the same executor. Application completion callbacks can
-  come from other threads; they enqueue delivery instead of reentering Rust.
-- Continuations required another executor argument and could fall back to inline execution on
-  rejection. `then(callback)` now uses the control executor and retains a registration through
-  delivery. Attaching a continuation after shutdown throws without consuming the original future.
-- Blocking on an incomplete future in an executor callback could deadlock. Blocking waits now throw
-  on that thread; zero-duration readiness checks remain allowed. Self-shutdown also throws.
-- The executor's work and drain conditions are separate, so a shutdown waiter cannot consume the
-  only notification intended for a sleeping worker.
-
-The older experimental branch's saved review also identified cancellation/free races, discarded
-lowered results, and leaked foreign oneshot senders. Those fixes are retained: only the driver touches
-Rust handles, READY always goes through complete/lift/free, and foreign cancellation sends exactly
-one cancelled completion to release the sender even after Rust drops its receiver.
-
 ## Execution and ownership
 
 All generated components linked into one C++ executable or shared library use the same inline
@@ -80,35 +41,13 @@ it does not replace Tokio or implement another network stack.
   where abandoning accepted cleanup would leak a handle or violate the FFI protocol.
 - Async trait interfaces retain the recovered `Foo` / `FooForeign` / `FooImpl` split. A Rust-backed
   async trait object returned as the common base needs a cast to `FooImpl` before invoking methods.
-  The integration probes verify foreign implementations crossing into Rust, not that reverse API.
+  The generic fixtures verify foreign implementations crossing into Rust, not that reverse API.
 
-## Local verification
+## Verification
 
-Verified on macOS arm64 with Apple Clang 21 and C++17:
+The 22 fixture tests cover async functions, methods, constructors, typed errors, cancellation,
+continuations, foreign implementations, and executor shutdown. The async API client test exercises
+the upstream example with application-owned workers for blocking work.
 
-- All 22 fixture CTest targets passed.
-- The futures suite passed 10 consecutive runs, including simultaneous callers and shutdown,
-  cancellation/completion races, pending foreign calls, typed errors, methods and constructors.
-- 2,000 simultaneously parked futures left process thread count unchanged: 4 before and 4 during.
-- A debug-build batch of 20,000 ready calls measured about 0.06 seconds (roughly 330,000 calls/second)
-  on this workstation. This is a local throughput check, not a production benchmark or latency SLA.
-- The futures executable passed AddressSanitizer + UndefinedBehaviorSanitizer, and separately
-  ThreadSanitizer. The Rust fixture library itself was not sanitizer-instrumented.
-- A real `livekit-ffi/core-modules` build generated and compiled all four C++ components. The core
-  probe passed HTTP/WebSocket round trips through foreign C++ async interfaces, typed transport
-  errors, cancellation, and shutdown across `livekit-net` and `livekit-ffi`.
-- A local C++ SDK shared library built with the unpublished generator. Its probe passed a generated
-  async timer call alongside the real legacy protobuf client, and transferred a Sox resampler's
-  ownership from protobuf FFI to UniFFI and back before cancellation and shutdown.
-
-Inputs were committed snapshots of the standalone `rust-sdks` checkout (`0a0fbe31`),
-`client-sdk-cpp` (`158d078`), and the C++ checkout's Rust submodule (`6047bebd`), with their checked-out
-native/protocol submodules. The C++ capture branch requires its own Rust schema; substituting the
-standalone Rust checkout causes capture protobuf compilation failures unrelated to async support.
-Original dirty files and submodule selections were preserved.
-
-The room-mode async exports exist only in the disposable snapshot: current main has not merged the
-room-mode data-track/data-stream UniFFI APIs. See [the integration probes](../cpp-tests/integration/livekit/README.md)
-for the test sources and reproduction steps. No live server, media traffic, Windows, or Linux runtime
-was exercised. Cross-platform CI and long-duration / large-payload measurements remain necessary
-before shipping.
+Downstream SDK integration tests belong in their consuming repositories. This repository keeps
+only the fixtures needed to verify generated bindings and the async runtime protocol.

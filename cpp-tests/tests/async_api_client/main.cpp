@@ -1,135 +1,75 @@
+#include <async_api_client_test.hpp>
 #include <test_common.hpp>
 
-#include <async_api_client.hpp>
-
-#include <atomic>
-#include <condition_variable>
-#include <deque>
-#include <memory>
-#include <mutex>
-#include <thread>
-
+using namespace std::chrono_literals;
 namespace api = async_api_client;
+using namespace async_api_client_test;
 
-class WorkerPool {
-public:
-    WorkerPool(): worker_([this] { run(); }) {}
-
-    ~WorkerPool() {
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            accepting_ = false;
-        }
-        ready_.notify_all();
-        worker_.join();
+template <typename Predicate> void eventually(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!predicate()) {
+        ASSERT_TRUE(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::yield();
     }
-
-    bool dispatch(uniffi::AsyncTask task) {
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            if (!accepting_) {
-                return false;
-            }
-            tasks_.push_back(std::move(task));
-        }
-        ready_.notify_one();
-        return true;
-    }
-
-private:
-    void run() {
-        for (;;) {
-            uniffi::AsyncTask task;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                ready_.wait(lock, [this] { return !accepting_ || !tasks_.empty(); });
-                if (tasks_.empty()) {
-                    return;
-                }
-                task = std::move(tasks_.front());
-                tasks_.pop_front();
-            }
-            task();
-        }
-    }
-
-    std::mutex mutex_;
-    std::condition_variable ready_;
-    std::deque<uniffi::AsyncTask> tasks_;
-    bool accepting_ = true;
-    std::thread worker_;
-};
-
-class TestHttpClient final : public api::HttpClientForeign {
-public:
-    uniffi::ForeignFuture<std::string> fetch(
-        const std::string &url,
-        const std::string &credentials
-    ) override {
-        return uniffi::ForeignFuture<std::string>(
-            [url, credentials](auto success, auto failure) {
-                if (
-                    credentials == "username:password" &&
-                    url == "https://api.github.com/repos/mozilla/uniffi-rs/issues/2017"
-                ) {
-                    success(api::test_response_data());
-                } else {
-                    failure(std::make_exception_ptr(
-                        std::runtime_error("unexpected HTTP request")
-                    ));
-                }
-                return [] {};
-            }
-        );
-    }
-};
-
-class TestTaskRunner final : public api::TaskRunnerForeign {
-public:
-    explicit TestTaskRunner(std::shared_ptr<WorkerPool> workers):
-        workers_(std::move(workers)) {}
-
-    uniffi::ForeignFuture<void> run_task(
-        const std::shared_ptr<api::RustTask> &task
-    ) override {
-        auto workers = workers_;
-        return uniffi::ForeignFuture<void>(
-            [workers, task](auto success, auto failure) {
-                auto cancelled = std::make_shared<std::atomic<bool>>(false);
-                if (!workers->dispatch([task, success, failure, cancelled] {
-                    if (cancelled->load()) {
-                        return;
-                    }
-                    try {
-                        task->execute();
-                        success();
-                    } catch (...) {
-                        failure(std::current_exception());
-                    }
-                })) {
-                    failure(std::make_exception_ptr(
-                        std::runtime_error("task worker rejected work")
-                    ));
-                }
-                return [cancelled] { cancelled->store(true); };
-            }
-        );
-    }
-
-private:
-    std::shared_ptr<WorkerPool> workers_;
-};
+}
 
 int main() {
     auto workers = std::make_shared<WorkerPool>();
-    auto client = api::ApiClient::init(
-        std::make_shared<TestHttpClient>(),
-        std::make_shared<TestTaskRunner>(workers)
-    );
+    auto runner = std::make_shared<TestTaskRunner>(workers);
+    auto client = api::ApiClient::init(std::make_shared<TestHttpClient>(workers), runner);
 
+    // The upstream success case, with credentials executed on application workers.
     auto issue = client->get_issue("mozilla", "uniffi-rs", 2017).get();
     ASSERT_EQ("Foreign-implemented async traits", issue.title);
     ASSERT_EQ(api::IssueState::kOpen, issue.state);
+    ASSERT_EQ("https://api.github.com/repos/mozilla/uniffi-rs/issues/2017", issue.url);
+    ASSERT_EQ(1, runner->executed());
+    ASSERT_FALSE(workers->ran_on_control.load());
 
-    return 0;
+    // A declared foreign HTTP error must survive C++ -> Rust -> C++ as the same variant and fields.
+    try {
+        client->get_issue("wrong", "repository", 2017).get();
+        ASSERT_TRUE(false);
+    } catch (const api::api_error::Http &error) {
+        ASSERT_EQ("Wrong URL: https://api.github.com/repos/wrong/repository/issues/2017",
+                  error.reason);
+    }
+    auto invalid =
+        api::ApiClient::init(std::make_shared<TestHttpClient>(workers, "invalid JSON"), runner);
+    EXPECT_EXCEPTION(invalid->get_issue("mozilla", "uniffi-rs", 2017).get(), api::api_error::Json);
+    invalid.reset();
+
+    std::vector<uniffi::Future<api::Issue>> calls;
+    for (int i = 0; i < 32; ++i) {
+        calls.push_back(client->get_issue("mozilla", "uniffi-rs", 2017));
+    }
+    for (auto &call : calls) {
+        ASSERT_EQ("Foreign-implemented async traits", call.get().title);
+    }
+    ASSERT_TRUE(workers->wait_idle());
+
+    // Hold the sole application worker so a queued RustTask can be deterministically cancelled.
+    auto entered = std::make_shared<std::promise<void>>();
+    auto release = std::make_shared<std::promise<void>>();
+    auto released = release->get_future().share();
+    ASSERT_TRUE(workers->dispatch([entered, released] {
+        entered->set_value();
+        released.wait();
+    }));
+    ASSERT_EQ(std::future_status::ready, entered->get_future().wait_for(5s));
+    const auto before = runner->executed();
+    const auto cancelled_before = runner->cancellations();
+    auto cancelled = client->get_issue("mozilla", "uniffi-rs", 2017);
+    eventually([&] { return workers->queued() != 0; });
+    cancelled.cancel();
+    EXPECT_EXCEPTION(cancelled.get(), uniffi::AsyncCancelledError);
+    eventually([&] { return runner->cancellations() > cancelled_before; });
+    release->set_value();
+    ASSERT_TRUE(workers->wait_idle());
+    ASSERT_EQ(before, runner->executed());
+    ASSERT_FALSE(workers->ran_on_control.load());
+
+    client.reset();
+    uniffi::shutdown_async_dispatcher();
+    workers->shutdown();
 }
