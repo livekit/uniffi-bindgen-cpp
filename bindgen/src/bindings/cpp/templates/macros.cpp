@@ -152,6 +152,26 @@
     )
 {%- endmacro %}
 
+{% macro rust_call_async_with_value(func, self_type, receiver) -%}
+    {%- let converter = self_type|lower_fn -%}
+    {%- let prefix = "uniffi::" ~ converter ~ "(" ~ receiver ~ ")" -%}
+    {%- match func.return_type() -%}
+    {%- when Some with (return_type) -%}
+    {%- call rust_call_async_with_prefix(prefix, func, return_type|type_name(ci)) -%}
+    {%- when None -%}
+    {%- call rust_call_async_void_with_prefix(prefix, func) -%}
+    {%- endmatch -%}
+{%- endmacro %}
+
+{% macro value_method_return_type(method) -%}
+    {%- if method.is_async() %}::uniffi::Future<{% endif -%}
+    {%- match method.return_type() -%}
+    {%- when Some with (return_type) -%}{{ return_type|type_name(ci) }}
+    {%- when None -%}void
+    {%- endmatch -%}
+    {%- if method.is_async() %}>{% endif -%}
+{%- endmacro %}
+
 {% macro param_list(func) %}
 {%- for arg in func.arguments() -%}
 {{ arg|parameter(ci) }}

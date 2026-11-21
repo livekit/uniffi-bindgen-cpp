@@ -1,15 +1,16 @@
 {%- for method in methods %}
-{%- if !method.is_async() %}
-{% match method.return_type() %}{% when Some with (return_type) %}{{ return_type|type_name(ci) }} {% else %}void {% endmatch -%}
-{{ method.name()|fn_name }}({{ type_name }} _uniffi_self{% if !method.arguments().is_empty() %}, {% endif %}{% call macros::param_list(method) %}) {
+{% call macros::value_method_return_type(method) %} {{ method.name()|fn_name }}({{ type_name }} _uniffi_self{% if !method.arguments().is_empty() %}, {% endif %}{% call macros::param_list(method) %}) {
+    {%- if method.is_async() %}
+    return {% call macros::rust_call_async_with_value(method, typ, "_uniffi_self") %};
+    {%- else %}
     {%- match method.return_type() %}
     {%- when Some with (return_type) %}
     return uniffi::{{ return_type|lift_fn }}({% call macros::rust_call_with_value(method, typ) %});
     {%- when None %}
     {% call macros::rust_call_with_value(method, typ) %};
     {%- endmatch %}
+    {%- endif %}
 }
-{%- endif %}
 {%- endfor %}
 
 {%- if let Some(method) = uniffi_trait_methods.display_fmt %}

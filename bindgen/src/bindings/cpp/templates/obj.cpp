@@ -54,19 +54,23 @@ namespace uniffi {
 {% endfor %}
 
 {%- for method in obj.methods() %}
+{%- let clone_receiver = "this->_uniffi_internal_clone_pointer()" %}
 {% if method.is_async() %}uniffi::Future<{% endif %}{% match method.return_type() %}{% when Some with (return_type) %}{{ return_type|type_name(ci) }}{% else %}void{% endmatch %}{% if method.is_async() %}>{% endif %}
 {{ impl_class_name }}::{{ method.name()|fn_name }}({% call macros::param_list(method) %}) {
-    auto ptr = this->_uniffi_internal_clone_pointer();
+    {# The async start callback clones the receiver only after the executor admission check. #}
+    {%- if !method.is_async() %}
+    auto ptr = {{ clone_receiver }};
+    {%- endif %}
     {%- match method.return_type() %}
     {% when Some with (return_type) %}
     {%- if method.is_async() %}
-    return {% call macros::rust_call_async_with_prefix("ptr", method, return_type|type_name(ci)) %};
+    return {% call macros::rust_call_async_with_prefix(clone_receiver, method, return_type|type_name(ci)) %};
     {%- else %}
     return uniffi::{{ return_type|lift_fn }}({% call macros::rust_call_with_prefix("ptr", method) %});
     {%- endif %}
     {%- else %}
     {%- if method.is_async() %}
-    return {% call macros::rust_call_async_void_with_prefix("ptr", method) %};
+    return {% call macros::rust_call_async_void_with_prefix(clone_receiver, method) %};
     {%- else %}
     {% call macros::rust_call_with_prefix("ptr", method) -%};
     {%- endif %}

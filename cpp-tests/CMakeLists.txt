@@ -43,9 +43,14 @@ if (VALGRIND)
 endif()
 endmacro(memcheck_test)
 
-# Add a bindings test case
+# Additional sources can supply the generated bindings for tests that reuse a fixture.
 macro(test_case TEST_NAME)
-add_executable(${TEST_NAME}-test tests/${TEST_NAME}/main.cpp ${BINDINGS_SRC_DIR}/${TEST_NAME}.cpp)
+set(TEST_SOURCES ${ARGN})
+if(NOT TEST_SOURCES)
+    set(TEST_SOURCES ${BINDINGS_SRC_DIR}/${TEST_NAME}.cpp)
+    list(APPEND BINDING_FILES ${TEST_SOURCES})
+endif()
+add_executable(${TEST_NAME}-test tests/${TEST_NAME}/main.cpp ${TEST_SOURCES})
 
 target_include_directories(${TEST_NAME}-test PRIVATE ${BINDINGS_SRC_DIR} include)
 target_link_directories(${TEST_NAME}-test PRIVATE ${BINDINGS_BUILD_DIR})
@@ -56,8 +61,6 @@ add_test(NAME ${TEST_NAME}-test COMMAND ${TEST_NAME}-test)
 memcheck_test(${TEST_NAME}-test)
 
 add_dependencies(${TEST_NAME}-test bindings)
-
-list(APPEND BINDING_FILES ${BINDINGS_SRC_DIR}/${TEST_NAME}.cpp)
 
 endmacro(test_case)
 
@@ -82,6 +85,7 @@ test_case(reserved_field_name)
 test_case(type_flattening)
 test_case(futures)
 test_case(async_api_client)
+test_case(async_executor tests/async_executor/ffi_lifecycle.cpp tests/async_executor/peer.cpp)
 
 add_executable(ext_types_import-test
     tests/ext_types_import/main.cpp
@@ -123,4 +127,4 @@ add_custom_target(bindings ALL
     COMMENT "Generating bindings"
 )
 
-set_tests_properties(async_api_client-test PROPERTIES TIMEOUT 45)
+set_tests_properties(async_api_client-test async_executor-test PROPERTIES TIMEOUT 45)

@@ -46,7 +46,11 @@ C++17 or newer is required to compile the bindings.
 
 # Async functions
 
-Rust async functions, constructors, and object methods return a move-only `uniffi::Future<T>`.
+UniFFI expects the foreign bindings to provide the scheduler for Rust futures. C++17 provides
+futures for waiting on results, so the generated bindings supply scheduling through `AsyncExecutor`.
+See [why C++ needs an executor](docs/ASYNC_RUNTIME.md#overview).
+
+Rust async functions, constructors, and methods return a move-only `uniffi::Future<T>`.
 The future supports `get()`, `wait()`, `wait_for()`, `cancel()`, and a consuming `then()` operation.
 Destroying an incomplete future requests cancellation. Cancellation races are resolved by the
 `RustCallStatus` returned by UniFFI completion, so a result that won the race is not discarded.
@@ -74,10 +78,11 @@ Keep continuations and foreign callback startup/cancellation actions short and n
 blocking application work to an existing application worker pool or async I/O service. Waiting on an
 incomplete generated future from the control executor throws `std::logic_error` instead of deadlocking.
 
-Stop application producers, then call `uniffi::shutdown_async_dispatcher()` from an application
-thread before unloading the Rust library. Shutdown rejects new calls, cancels active calls, drains
-queued cleanup and continuations, and joins the worker. The executor cannot be restarted. A
-nonreturning application callback can prevent shutdown from completing.
+Stop application producers, then call `uniffi::shutdown_async_executor()` from an application
+thread before unloading the Rust library. Shutdown rejects new C++ calls to async Rust exports
+with `uniffi::AsyncExecutorError`, cancels active calls, drains queued cleanup and continuations,
+and joins the worker. Shutdown is terminal. A nonreturning application callback can prevent
+shutdown from completing.
 
 Async callback-interface methods return `uniffi::ForeignFuture<T>` from their C++ implementation.
 The start function arranges application work, invokes exactly one supplied completion callback, and
@@ -98,8 +103,7 @@ Completion callbacks may be invoked from any application thread; the bridge defe
 The generated bridge arbitrates success, failure, and Rust-side drop exactly once. A dropped Rust
 future invokes the returned cancellation action and closes the UniFFI completion channel.
 
-See [the runtime design review](docs/ASYNC_RUNTIME.md) for ownership, shutdown, performance checks,
-and local LiveKit SDK verification.
+See [the async runtime design](docs/ASYNC_RUNTIME.md) for handle ownership, scheduling, and shutdown.
 
 # Configuration options
 

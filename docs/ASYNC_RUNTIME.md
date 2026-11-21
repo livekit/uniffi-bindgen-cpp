@@ -1,53 +1,228 @@
-# C++17 async runtime
+# Async Runtime
 
-## Execution and ownership
+## Overview
 
-All generated components linked into one C++ executable or shared library use the same inline
-runtime instance. This is not a singleton shared across independently built DLLs/DSOs.
+UniFFI uses the foreign bindings' runtime to schedule Rust future polls and completions. C++ has
+no default async runtime for this work. The generated bindings provide a shared
+[`AsyncExecutor`](../bindgen/src/bindings/cpp/templates/async.hpp) for async Rust exports and
+C++ callback methods that Rust awaits.
 
-One lazy, joinable worker executes short control tasks. Each Rust future has at most one queued or
-running driver and one outstanding UniFFI poll. Wakes enqueue work only when progress is possible;
-there is no timer scanning, blocking waiter, or C++ thread per operation. A driver yields after 64
-actions so repeated immediate wakes do not monopolize the queue.
+- **One worker thread.** Generated components in each linked executable or shared library share a
+  worker and a FIFO queue. [Executor][executor]
+- **UniFFI Rust future calls.** The wrapper obtains the future handle on the caller's thread.
+  The worker calls `rust_future_poll` and repolls on `WAKE`. On `READY` it calls
+  `rust_future_complete` to collect the value or error, then `rust_future_free` to release the
+  handle. It requests cancellation with `rust_future_cancel`. [UniFFI handle rules][rust-handle-rules]
+- **Pending calls and continuations.** The worker can run other tasks while a future waits for a
+  wake. C++ continuations run on the worker, so keep them short and do blocking waits on
+  application threads. [Continuation delivery][completion] · [Wait guard][wait-guard]
+- **Async C++ callbacks.** When Rust awaits a C++ `ForeignFuture<T>`, the worker starts the
+  callback and delivers its result or handles cancellation. [Callback bridge][callback-results]
+- **Shutdown.** Call `shutdown_async_executor()` from an application thread to stop admission,
+  cancel outstanding work, drain the queue, and join the worker. [Shutdown][shutdown]
 
-The executor's registry owns an active Rust state until completion frees its handle. This also lets
-poll callbacks reuse the state's address instead of allocating a new userdata holder for every poll.
-Future destruction and explicit cancellation request work through that state; neither calls
-`rust_future_cancel` directly from an application thread. Rust's terminal call status decides whether
-completion or cancellation won the race, so a successful result is not discarded or leaked.
+The sequence adapts the [UniFFI Async Overview][upstream-sequence] to the C++ executor.
 
-A C++ foreign operation returns `ForeignFuture<T>` containing a start function. That function arranges
-nonblocking application work and returns a cancellation action. The bridge keeps the implementation
-alive until success, failure, or cancellation wins. Application captures are released outside internal
-state locks. A `FutureContinuation` owns its cancellation action; retain it until delivery. Its return
-from `then` is marked `nodiscard` to catch accidental immediate cancellation.
+```mermaid
+sequenceDiagram
+    participant C as C++ caller
+    participant B as Generated C++ binding
+    participant E as AsyncExecutor
+    participant R as Rust scaffolding
 
-Rust still owns its I/O runtimes. This executor supplies the missing C++ control/runtime boundary;
-it does not replace Tokio or implement another network stack.
+    C->>B: call async function
+    B->>R: call scaffolding function
+    R-->>B: return RustFuture handle
+    B->>B: Register RustFutureState with the executor
+    B->>E: Queue drive() for the first poll
+    B-->>C: Return Future
 
-## Limits and contract
+    loop One outstanding poll until READY
+        E->>R: rust_future_poll(handle, continuation, state)
+        alt WAKE
+            Note over E: The worker can run other tasks<br/>while this future waits for a wake
+            R->>B: continuation(state, WAKE)
+            B->>E: Request another poll
+        else READY
+            R->>B: continuation(state, READY)
+            B->>B: Record readiness
+        end
+    end
 
-- Continuations, foreign method startup, cancellation actions, and Rust polls must return promptly.
-  Blocking I/O or CPU-heavy work belongs on an application's existing workers / async I/O service,
-  or the Rust runtime's appropriate task pool. A single long-running poll cannot be preempted.
-- Shutdown is final for the binding image, not an operation to perform on every room disconnect.
-  Stop producers, call `shutdown_async_dispatcher()` on an application thread, and release generated
-  objects before unloading Rust. Restartable runtime instances are not implemented.
-- A foreign cancellation action must release its operation's resources and prevent unbounded work.
-  The bridge cannot forcibly join application-owned workers. A nonreturning callback can stall
-  executor shutdown.
-- Queue/state memory grows with requested concurrency and captured payloads. Driver wakeups are
-  coalesced; this is not a fixed-capacity or hard-real-time executor. Allocation exhaustion is fatal
-  where abandoning accepted cleanup would leak a handle or violate the FFI protocol.
-- Async trait interfaces retain the recovered `Foo` / `FooForeign` / `FooImpl` split. A Rust-backed
-  async trait object returned as the common base needs a cast to `FooImpl` before invoking methods.
-  The generic fixtures verify foreign implementations crossing into Rust, not that reverse API.
+    E->>R: rust_future_complete(handle, &status)
+    R-->>E: Lowered result and RustCallStatus
+    E->>E: Check status and lift value
+    E->>R: rust_future_free(handle)
+    E->>E: Untrack the call
+    E->>B: Publish to FutureCompletionState
+    Note over C,E: get() reads the result or throws<br/>then() delivers on the worker
+```
 
-## Verification
+## Execution model
 
-The 22 fixture tests cover async functions, methods, constructors, typed errors, cancellation,
-continuations, foreign implementations, and executor shutdown. The async API client test exercises
-the upstream example with application-owned workers for blocking work.
+The `async_executor()` singleton creates a joinable worker on first use. The worker takes short
+tasks from a FIFO queue and sleeps on a condition variable when the queue is empty. Pending Rust
+futures retain their state and wake callback. Each driver runs at most 64 actions per turn before
+yielding to the queue. [Executor][executor] · [Driver][drive]
 
-Downstream SDK integration tests belong in their consuming repositories. This repository keeps
-only the fixtures needed to verify generated bindings and the async runtime protocol.
+```mermaid
+flowchart LR
+    A[Application thread] -->|Schedule driver| Q[Control queue]
+    Q --> W[One C++ worker]
+    W -->|Poll or finish| R[Rust scaffolding]
+    R -->|Wake callback| Q
+    W -->|Publish result| F[C++ future or continuation]
+```
+
+A move-only `Future<T>` supports `wait()`, `wait_for()`, `get()`, `cancel()`, and a consuming
+`then()`. `get()` returns the lifted value or rethrows the stored exception. `then()` transfers
+cancellation ownership to its return value, a `FutureContinuation`, and delivers the result on
+the worker. Hold that token until delivery or cancel it to request cancellation. Only application
+threads may block on an incomplete call. The worker can inspect readiness or consume a ready result.
+[Future API][future] · [Completion state][completion] · [Worker wait guard][wait-guard]
+
+## C++ calls an async Rust export
+
+The generator uses the same driver for free functions, primary and secondary constructors, and
+methods on objects, records, and enums. The wrapper checks the Rust contract version and checksums,
+lowers the arguments, and calls the start symbol to obtain a `uint64_t` Rust future handle. The
+generator selects poll, cancel, complete, and free symbols from UniFFI metadata for the lowered
+result type. It also selects the value and error conversions, including the `void` case. An admitted
+object method passes a cloned receiver handle. A record or enum method lowers its receiver by value
+inside the start call. Rust owns the lifted receiver across polls and writes `RustCallStatus` through
+an out pointer on completion. [Function template][function] · [Object template][object] ·
+[Value methods][value-methods] · [Flat enum methods][flat-enum-methods] ·
+[Async call macros][macros] · [Initialization][init] · [Rust scaffolding][tokio]
+
+- **Create a handle and poll with a callback and opaque data.** `rust_call_async` gives the acquired
+  handle to a scope guard. `start()` registers shared ownership of `RustFutureState` with the
+  executor and schedules the first poll. The poll passes the state's address as callback data.
+  The callback takes a strong reference to the state on entry.
+  [Handle guard][handle-guard] · [Start and callback lifetime][state-start] · [Poll][poll]
+- **Poll again on `WAKE` and complete on `READY`.** The callback clears `poll_outstanding_` and
+  records `poll_requested_` for `WAKE` (`1`) or `ready_` for `READY` (`0`) under the state mutex.
+  `next_action()` sets `poll_outstanding_` before invoking Rust and admits another poll only after
+  that callback. Rust guarantees one callback per poll, which can arrive from another thread.
+  [C++ state transitions][continuation] · [Rust poll guarantee][rust-poll]
+- **Complete once and stop polling.** `next_action()` gives `READY` priority and sets `terminal_`
+  before returning `CompleteFuture`. That flag closes the driver, callback, and cancellation paths.
+  The worker completes once, checks `RustCallStatus`, and lifts the value on success.
+  [Action selection][next-action] · [Result conversion][finish] · [Status handling][status]
+- **Free the handle as the last FFI operation.** The driver frees the handle before removing the
+  registry entry and publishing the result. Status, lifting, and result-transfer failures are
+  stored as exceptions for the caller. The scope guard owns the handle until registration
+  succeeds. It frees the handle if registration fails, including when admission closes during
+  handle creation. The wrapper arms `Future<T>` cancellation after successful registration.
+  [Completion and free][finish] · [Guard and handoff][call-async] · [Admission race][state-start]
+- **Serialize optional cancellation with the rest of the lifecycle.** `cancel()` and token
+  destruction request work on the driver. It sends at most one `rust_future_cancel`. After the
+  driver sets `terminal_`, only completion and free can touch the handle.
+  [Action selection][next-action] · [Cancellation FFI call][cancel] ·
+  [Rust handle rules][rust-handle-rules]
+
+Wake-ups also work when Rust invokes the callback inline during `poll`. `scheduled_` and `driving_`
+coalesce driver requests. The driver rechecks the flags under the mutex before parking, covering a
+callback that arrives as the driver is about to yield. FFI calls run with the state mutex released,
+so inline callbacks can acquire it and return. [Driver scheduling and parking][drive]
+
+Cancellation with a poll outstanding produces `READY` from the Rust scheduler. If cancellation
+arrives before a callback is installed, the worker polls the cancelled handle to get `READY`.
+`complete` consumes any result already produced by Rust. If Rust has no result, it reports
+`Cancelled` and drops the pending future. The C++ wrapper maps that status to `AsyncCancelledError`
+and runs the same cleanup path. This preserves results that win the cancellation race.
+[C++ cancel path][cancel] · [Rust scheduler][rust-scheduler] · [Rust completion][rust-complete]
+
+## Rust awaits an async C++ callback
+
+A generated async callback method returns a move-only `ForeignFuture<T>` on the C++ side. Its start
+function accepts success and failure callbacks and returns an optional cancellation action. In the
+FFI vtable, the method returns `void` and accepts a completion function, its original `uint64_t`
+context, and an output slot for the drop callback. The trampoline fills the drop slot, lifts the
+arguments, and queues startup. Application code can arrange blocking work on an application
+worker and signal completion from that worker. [C++ callback surface][callback-api] ·
+[Vtable trampoline][callback-entry] · [Upstream async API client][api-client]
+
+```mermaid
+sequenceDiagram
+    participant R as Rust future
+    participant B as C++ callback bridge
+    participant E as Control worker
+    participant A as C++ implementation
+    R->>B: Call vtable with completion and context
+    B-->>R: Write drop callback and task handle
+    B->>E: Queue startup
+    E->>A: Start ForeignFuture
+    A-->>E: Return cancellation action
+    alt Application resolves or fails
+        A->>E: Queue completion
+    else Rust drops the future
+        R->>B: Invoke drop callback
+        B->>E: Release handle and queue cancellation
+    end
+    E->>R: Complete once with original context and status
+```
+
+The `finished_` gate in `ForeignFutureTaskState` is shared by success, error, and cancellation.
+The first terminal action takes that gate. Success lowers a value into the metadata-defined result
+structure. Failure sends a declared UniFFI error or an unexpected exception message, including
+exceptions from moving a value into the queue or lowering it. A `void` completion carries just the
+status. The completion function consumes Rust's one-shot sender using the original context. These
+paths run on the control worker for an active executor, even when an application worker supplies
+the result. [Completion lowering and queueing][callback-results] ·
+[Terminal gate][foreign-state] · [Rust receiver and completion callback][rust-foreign]
+
+The drop slot owns a separate handle to the C++ task state. The state retains the callback object
+through the registered cancel action, and moves that action out of its mutex before running or
+releasing it. If cancellation takes the terminal gate, the drop path requests application
+cancellation and sends a cancelled completion to release Rust's sender. If completion took the
+gate, a later drop just releases the C++ handle.
+[Startup and retained callback object][callback-results] ·
+[Drop callback and cancellation][foreign-drop] · [UniFFI foreign handle contract][foreign-rules]
+
+## Shutdown
+
+Stop producers before calling `shutdown_async_executor()` from an application thread. The executor
+closes admission, requests cancellation for registered calls, drains the queue and in-flight work,
+and joins the worker. New C++ calls to async Rust exports receive `AsyncExecutorError` after
+shutdown. The callback trampoline reports cancellation to Rust if the executor rejects startup.
+Continuation delivery retains its own registration until its callback is released. Shutdown is
+terminal for the binding image. Keep control callbacks short so other calls and shutdown can make
+progress. [Drain and join][shutdown] · [Continuation registration][registration] ·
+[Callback bridge][callback-results]
+
+[upstream-sequence]: https://mozilla.github.io/uniffi-rs/latest/internals/async-overview.html#rust-async-functions
+[rust-handle-rules]: https://mozilla.github.io/uniffi-rs/latest/internals/async-ffi.html#managing-the-rustfuture-handle
+[foreign-rules]: https://mozilla.github.io/uniffi-rs/latest/internals/async-ffi.html#managing-the-foreignfuture-handle
+[api-client]: https://github.com/mozilla/uniffi-rs/tree/05b45b110f652d58d94c653992aeb3adc3a094f4/examples/async-api-client
+[tokio]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_macros/src/export/scaffolding.rs#L271-L299
+[rust-poll]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/rustfuture/mod.rs#L119-L149
+[rust-scheduler]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/rustfuture/scheduler.rs#L80-L84
+[rust-complete]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/rustfuture/future.rs#L162-L179
+[rust-foreign]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/foreignfuture.rs#L67-L99
+[executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L15-L135
+[drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L205-L288
+[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L392-L497
+[completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L283-L371
+[wait-guard]: ../bindgen/src/bindings/cpp/templates/async.hpp#L146-L152
+[function]: ../bindgen/src/bindings/cpp/templates/fn_def.cpp#L1-L20
+[object]: ../bindgen/src/bindings/cpp/templates/obj.cpp#L32-L78
+[value-methods]: ../bindgen/src/bindings/cpp/templates/value_methods.cpp#L1-L14
+[flat-enum-methods]: ../bindgen/src/bindings/cpp/templates/flat_enum_methods.cpp#L1-L14
+[macros]: ../bindgen/src/bindings/cpp/templates/macros.cpp#L69-L164
+[init]: ../bindgen/src/bindings/cpp/templates/wrapper.cpp#L13-L37
+[handle-guard]: ../bindgen/src/bindings/cpp/templates/async.cpp#L110-L129
+[state-start]: ../bindgen/src/bindings/cpp/templates/async.cpp#L144-L183
+[poll]: ../bindgen/src/bindings/cpp/templates/async.cpp#L290-L294
+[continuation]: ../bindgen/src/bindings/cpp/templates/async.cpp#L179-L203
+[next-action]: ../bindgen/src/bindings/cpp/templates/async.cpp#L222-L241
+[finish]: ../bindgen/src/bindings/cpp/templates/async.cpp#L306-L336
+[status]: ../bindgen/src/bindings/cpp/templates/wrapper.cpp#L40-L64
+[call-async]: ../bindgen/src/bindings/cpp/templates/async.cpp#L359-L394
+[cancel]: ../bindgen/src/bindings/cpp/templates/async.cpp#L296-L304
+[callback-api]: ../bindgen/src/bindings/cpp/templates/callback.hpp#L6-L35
+[callback-entry]: ../bindgen/src/bindings/cpp/templates/callback_iface_tmpl.cpp#L7-L22
+[callback-results]: ../bindgen/src/bindings/cpp/templates/callback_iface_tmpl.cpp#L24-L140
+[foreign-state]: ../bindgen/src/bindings/cpp/templates/async.cpp#L9-L88
+[foreign-drop]: ../bindgen/src/bindings/cpp/templates/async.cpp#L65-L108
+[shutdown]: ../bindgen/src/bindings/cpp/templates/async.hpp#L59-L85
+[registration]: ../bindgen/src/bindings/cpp/templates/async.hpp#L273-L281

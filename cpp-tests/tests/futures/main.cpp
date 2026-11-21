@@ -168,6 +168,12 @@ int main() {
     auto record = futures::new_my_record("value", 42).get();
     ASSERT_EQ("value", record.a);
     ASSERT_EQ(42, record.b);
+    auto record_value = futures::MyRecord{"value", 17}.value_after(1);
+    ASSERT_EQ(17, record_value.get());
+
+    futures::validate(futures::ValidationMode::kAllow).get();
+    EXPECT_EXCEPTION(futures::validate(futures::ValidationMode::kReject).get(),
+                     futures::my_error::Foo);
 
     auto holding = futures::use_shared_resource({2000, 4000});
     std::this_thread::sleep_for(500ms);
@@ -225,8 +231,6 @@ int main() {
     }
     if (auto threads_parked = thread_count(); threads_before && threads_parked) {
         ASSERT_TRUE(*threads_parked <= *threads_before + 1);
-        std::cout << "2000 parked futures: process threads " << *threads_before << " -> "
-                  << *threads_parked << "\n";
     }
     for (auto &future : parked) {
         future.cancel();
@@ -236,26 +240,14 @@ int main() {
     }
     ASSERT_EQ(0, futures::pending_count());
 
-    const auto begin = std::chrono::steady_clock::now();
-    std::vector<uniffi::Future<bool>> ready_batch;
-    for (int i = 0; i < 20000; ++i) {
-        ready_batch.push_back(futures::always_ready());
-    }
-    for (auto &future : ready_batch) {
-        ASSERT_TRUE(future.get());
-    }
-    const auto elapsed =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
-    std::cout << "20000 ready calls: " << elapsed << "s (" << 20000 / elapsed << " calls/s)\n";
-
     // A continuation runs on the shared executor and cannot block it waiting on another call.
     auto callback_done = std::make_shared<std::promise<void>>();
     auto nested = std::move(futures::always_ready()).then([callback_done](auto result) {
-        ASSERT_TRUE(uniffi::detail::default_async_dispatcher().is_worker());
+        ASSERT_TRUE(uniffi::detail::async_executor().is_worker());
         ASSERT_TRUE(std::move(result).get());
         auto inner = futures::pending();
         EXPECT_EXCEPTION(inner.get(), std::logic_error);
-        EXPECT_EXCEPTION(uniffi::shutdown_async_dispatcher(), std::logic_error);
+        EXPECT_EXCEPTION(uniffi::shutdown_async_executor(), std::logic_error);
         callback_done->set_value();
     });
     ASSERT_EQ(std::future_status::ready, callback_done->get_future().wait_for(5s));
@@ -269,7 +261,7 @@ int main() {
                 try {
                     ASSERT_TRUE(futures::always_ready().get());
                     ++produced;
-                } catch (const uniffi::AsyncDispatcherError &) {
+                } catch (const uniffi::AsyncExecutorError &) {
                     std::this_thread::yield();
                 } catch (const uniffi::AsyncCancelledError &) {
                     // Shutdown also cancels calls accepted immediately before it.
@@ -287,17 +279,18 @@ int main() {
     auto shutdown_pending = futures::pending();
     auto shutdown_foreign = futures::wait_using_parser(
         std::make_shared<TestAsyncParser>(started_count, cancellation_count, destruction_count));
-    uniffi::shutdown_async_dispatcher();
+    uniffi::shutdown_async_executor();
     stop_producers.store(true);
     for (auto &producer : producers) {
         producer.join();
     }
-    EXPECT_EXCEPTION(std::move(late_continuation).then([](auto) {}), uniffi::AsyncDispatcherError);
+    EXPECT_EXCEPTION(static_cast<void>(std::move(late_continuation).then([](auto) {})),
+                     uniffi::AsyncExecutorError);
     ASSERT_TRUE(late_continuation.get());
-    uniffi::shutdown_async_dispatcher(); // Idempotent.
+    uniffi::shutdown_async_executor(); // Idempotent.
     EXPECT_EXCEPTION(shutdown_pending.get(), uniffi::AsyncCancelledError);
     EXPECT_EXCEPTION(shutdown_foreign.get(), uniffi::AsyncCancelledError);
-    EXPECT_EXCEPTION(futures::always_ready().get(), uniffi::AsyncDispatcherError);
+    EXPECT_EXCEPTION(futures::always_ready().get(), uniffi::AsyncExecutorError);
 
     return 0;
 }

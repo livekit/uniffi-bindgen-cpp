@@ -53,7 +53,7 @@
 
     {% match method.return_type() %}
     {% when Some(t) %}
-    auto deliver_success = [state, complete, uniffi_callback_data]({{ t|type_name(ci) }} value) {
+    auto deliver_success = [state, complete, uniffi_callback_data](const {{ t|type_name(ci) }} &value) {
         if (!state->finish()) {
             return;
         }
@@ -80,20 +80,24 @@
     {% endmatch %}
 
     auto complete_failure = [state, deliver_failure](std::exception_ptr error) {
-        ::uniffi::detail::dispatch_async([state, deliver_failure, error] {
+        state->enqueue_or_cancel([deliver_failure, error] {
             deliver_failure(error);
         });
     };
     {% match method.return_type() %}
     {% when Some(t) %}
-    auto complete_success = [state, deliver_success]({{ t|type_name(ci) }} value) {
-        ::uniffi::detail::dispatch_async([state, deliver_success, value = std::move(value)]() mutable {
-            deliver_success(std::move(value));
-        });
+    auto complete_success = [state, deliver_success, complete_failure]({{ t|type_name(ci) }} &&value) {
+        try {
+            state->enqueue_or_cancel([deliver_success, value = std::move(value)] {
+                deliver_success(value);
+            });
+        } catch (...) {
+            complete_failure(std::current_exception());
+        }
     };
     {% when None %}
     auto complete_success = [state, deliver_success]() {
-        ::uniffi::detail::dispatch_async([state, deliver_success] { deliver_success(); });
+        state->enqueue_or_cancel([deliver_success] { deliver_success(); });
     };
     {% endmatch %}
 
@@ -107,7 +111,7 @@
         {%- for arg in method.arguments() %}
         auto arg{{ loop.index0 }} = {{- arg|lift_fn }}({{ arg.name()|var_name }});
         {%- endfor %}
-        ::uniffi::detail::dispatch_async([
+        state->enqueue_or_cancel([
             state, obj, complete_success, complete_failure
             {%- for arg in method.arguments() %}, arg{{ loop.index0 }} = std::move(arg{{ loop.index0 }}){% endfor %}
         ]() mutable {
@@ -116,13 +120,17 @@
                 return;
             }
             try {
-        auto future = obj->{{ method.name()|var_name }}(
-        {%- for arg in method.arguments() %}
-            arg{{ loop.index0 }}{%- if !loop.last %}, {% endif %}
-        {%- endfor %}
-        );
-        auto cancel = std::move(future).start(complete_success, complete_failure);
-        state->set_cancel([obj, cancel = std::move(cancel)] { if (cancel) { cancel(); } });
+                auto future = obj->{{ method.name()|var_name }}(
+                {%- for arg in method.arguments() %}
+                    arg{{ loop.index0 }}{%- if !loop.last %}, {% endif %}
+                {%- endfor %}
+                );
+                auto cancel = std::move(future).start(complete_success, complete_failure);
+                state->set_cancel([obj, cancel = std::move(cancel)] {
+                    if (cancel) {
+                        cancel();
+                    }
+                });
             } catch (...) {
                 complete_failure(std::current_exception());
             }

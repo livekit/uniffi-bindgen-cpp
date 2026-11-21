@@ -17,7 +17,7 @@ class WorkerPool {
     }
     ~WorkerPool() { shutdown(); }
 
-    bool dispatch(uniffi::AsyncTask task) {
+    bool enqueue(uniffi::AsyncTask task) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!accepting_ || tasks_.size() >= capacity_) {
@@ -68,7 +68,7 @@ class WorkerPool {
                 tasks_.pop_front();
                 ++running_;
             }
-            if (uniffi::detail::default_async_dispatcher().is_worker()) {
+            if (uniffi::detail::async_executor().is_worker()) {
                 ran_on_control = true;
             }
             task();
@@ -101,7 +101,7 @@ class TestHttpClient final : public api::HttpClientForeign {
         return uniffi::ForeignFuture<std::string>([workers = workers_, response = response_, url,
                                                    credentials](auto success, auto failure) {
             auto cancelled = std::make_shared<std::atomic<bool>>(false);
-            if (!workers->dispatch([response, url, credentials, success, failure, cancelled] {
+            if (!workers->enqueue([response, url, credentials, success, failure, cancelled] {
                     if (cancelled->load()) {
                         return;
                     }
@@ -133,7 +133,7 @@ class TestTaskRunner final : public api::TaskRunnerForeign {
         return uniffi::ForeignFuture<void>([counters = counters_, workers = workers_,
                                             task](auto success, auto failure) {
             auto cancelled = std::make_shared<std::atomic<bool>>(false);
-            if (!workers->dispatch([counters, task, success, failure, cancelled] {
+            if (!workers->enqueue([counters, task, success, failure, cancelled] {
                     if (cancelled->load()) {
                         return;
                     }

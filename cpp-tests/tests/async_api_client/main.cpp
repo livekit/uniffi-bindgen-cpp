@@ -52,7 +52,7 @@ int main() {
     auto entered = std::make_shared<std::promise<void>>();
     auto release = std::make_shared<std::promise<void>>();
     auto released = release->get_future().share();
-    ASSERT_TRUE(workers->dispatch([entered, released] {
+    ASSERT_TRUE(workers->enqueue([entered, released] {
         entered->set_value();
         released.wait();
     }));
@@ -70,6 +70,6 @@ int main() {
     ASSERT_FALSE(workers->ran_on_control.load());
 
     client.reset();
-    uniffi::shutdown_async_dispatcher();
+    uniffi::shutdown_async_executor();
     workers->shutdown();
 }

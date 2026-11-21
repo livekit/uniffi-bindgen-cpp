@@ -3,9 +3,9 @@ class AsyncCancelledError : public std::runtime_error {
     AsyncCancelledError() : std::runtime_error("UniFFI async call cancelled") {}
 };
 
-class AsyncDispatcherError : public std::runtime_error {
+class AsyncExecutorError : public std::runtime_error {
   public:
-    AsyncDispatcherError() : std::runtime_error("UniFFI async dispatcher rejected a task") {}
+    AsyncExecutorError() : std::runtime_error("UniFFI async executor rejected a task") {}
 };
 
 using AsyncTask = std::function<void()>;
@@ -14,14 +14,14 @@ namespace detail {
 
 // One control executor per linked C++ image, shared by all generated components. Tasks must not
 // block.
-class DefaultAsyncDispatcher {
+class AsyncExecutor {
   public:
-    DefaultAsyncDispatcher() : worker_([this] { run(); }) {}
-    DefaultAsyncDispatcher(const DefaultAsyncDispatcher &) = delete;
-    DefaultAsyncDispatcher &operator=(const DefaultAsyncDispatcher &) = delete;
-    ~DefaultAsyncDispatcher() { shutdown(); }
+    AsyncExecutor() : worker_([this] { run(); }) {}
+    AsyncExecutor(const AsyncExecutor &) = delete;
+    AsyncExecutor &operator=(const AsyncExecutor &) = delete;
+    ~AsyncExecutor() { shutdown(); }
 
-    bool dispatch(AsyncTask task) {
+    bool enqueue(AsyncTask task) {
         {
             std::lock_guard<std::mutex> guard(mutex_);
             if (stopped_) {
@@ -54,7 +54,7 @@ class DefaultAsyncDispatcher {
         return accepting_;
     }
 
-    bool is_worker() const noexcept { return std::this_thread::get_id() == worker_id_; }
+    bool is_worker() const noexcept { return current_worker_ == this; }
 
     void shutdown() {
         if (is_worker()) {
@@ -86,12 +86,14 @@ class DefaultAsyncDispatcher {
 
   private:
     void run() noexcept {
+        current_worker_ = this;
         for (;;) {
             AsyncTask task;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 ready_.wait(lock, [this] { return !tasks_.empty() || stopped_; });
                 if (tasks_.empty()) {
+                    current_worker_ = nullptr;
                     return;
                 }
                 task = std::move(tasks_.front());
@@ -123,28 +125,28 @@ class DefaultAsyncDispatcher {
     bool accepting_ = true;
     bool stopped_ = false;
     bool running_ = false;
+    inline static thread_local const AsyncExecutor *current_worker_ = nullptr;
     std::thread worker_;
-    const std::thread::id worker_id_ = worker_.get_id();
 };
 
-inline DefaultAsyncDispatcher &default_async_dispatcher() {
-    static DefaultAsyncDispatcher dispatcher;
-    return dispatcher;
+inline AsyncExecutor &async_executor() {
+    static AsyncExecutor executor;
+    return executor;
 }
 
-inline bool dispatch_async(AsyncTask task) noexcept {
+inline bool enqueue_async(AsyncTask task) noexcept {
     try {
-        return default_async_dispatcher().dispatch(std::move(task));
+        return async_executor().enqueue(std::move(task));
     } catch (...) {
         // An accepted operation must retain a deferred cleanup path even under allocation failure.
         std::terminate();
     }
 }
 
-inline bool begin_async_call() { return default_async_dispatcher().accepting(); }
+inline bool begin_async_call() { return async_executor().accepting(); }
 
 inline void check_blocking_wait(bool ready) {
-    if (!ready && default_async_dispatcher().is_worker()) {
+    if (!ready && async_executor().is_worker()) {
         throw std::logic_error("Cannot block the UniFFI executor; use Future::then instead");
     }
 }
@@ -153,7 +155,7 @@ inline void check_blocking_wait(bool ready) {
 
 // Cancels in-flight calls, drains their Rust handles and queued completions, and joins the worker.
 // Stop producers first. Call from an application thread, before unloading the Rust library.
-inline void shutdown_async_dispatcher() { detail::default_async_dispatcher().shutdown(); }
+inline void shutdown_async_executor() { detail::async_executor().shutdown(); }
 
 // C++17 adapter for an async callback-interface method. The implementation starts work when the
 // generated bridge supplies success and failure callbacks, and returns an optional cancel action.
@@ -214,7 +216,22 @@ template <> class ForeignFuture<void> {
 template <typename T> class FutureResult {
   public:
     explicit FutureResult(T value) : value_(std::move(value)) {}
-    explicit FutureResult(std::exception_ptr error) : error_(std::move(error)) {}
+    explicit FutureResult(std::exception_ptr error) noexcept : error_(std::move(error)) {}
+
+    FutureResult(const FutureResult &) = default;
+    FutureResult &operator=(const FutureResult &) = default;
+    FutureResult &operator=(FutureResult &&) = default;
+
+    FutureResult(FutureResult &&other) noexcept : error_(std::move(other.error_)) {
+        if (other.value_) {
+            try {
+                value_.emplace(std::move(*other.value_));
+            } catch (...) {
+                // Deliver a failed value transfer through the future's normal error path.
+                error_ = std::current_exception();
+            }
+        }
+    }
 
     bool has_value() const noexcept { return !error_; }
     std::exception_ptr error() const noexcept { return error_; }
@@ -234,7 +251,7 @@ template <typename T> class FutureResult {
 template <> class FutureResult<void> {
   public:
     FutureResult() = default;
-    explicit FutureResult(std::exception_ptr error) : error_(std::move(error)) {}
+    explicit FutureResult(std::exception_ptr error) noexcept : error_(std::move(error)) {}
 
     bool has_value() const noexcept { return !error_; }
     std::exception_ptr error() const noexcept { return error_; }
@@ -254,12 +271,12 @@ namespace detail {
 // Retains the executor through delivery, including when then() is attached to an already-ready
 // call.
 struct ContinuationRegistration {
-    ContinuationRegistration() : id(default_async_dispatcher().track([] {})) {
+    ContinuationRegistration() : id(async_executor().track([] {})) {
         if (!id) {
-            throw AsyncDispatcherError();
+            throw AsyncExecutorError();
         }
     }
-    ~ContinuationRegistration() { default_async_dispatcher().untrack(id); }
+    ~ContinuationRegistration() { async_executor().untrack(id); }
     uint64_t id;
 };
 
@@ -280,7 +297,7 @@ template <typename T> class FutureCompletionState {
         }
         ready_.notify_all();
         if (callback) {
-            dispatch_continuation(std::move(callback));
+            enqueue_continuation(std::move(callback));
         }
     }
 
@@ -324,7 +341,7 @@ template <typename T> class FutureCompletionState {
                 return;
             }
         }
-        dispatch_continuation(std::move(callback));
+        enqueue_continuation(std::move(callback));
     }
 
   private:
@@ -335,14 +352,14 @@ template <typename T> class FutureCompletionState {
         claimed_ = true;
     }
 
-    void dispatch_continuation(Callback callback) noexcept {
+    void enqueue_continuation(Callback callback) noexcept {
         Result result = [&] {
             std::lock_guard<std::mutex> guard(mutex_);
             return std::move(*result_);
         }();
         auto delivery =
             std::make_shared<std::pair<Callback, Result>>(std::move(callback), std::move(result));
-        if (!dispatch_async([delivery]() mutable {
+        if (!enqueue_async([delivery]() mutable {
                 try {
                     delivery->first(std::move(delivery->second));
                 } catch (...) {
@@ -413,7 +430,8 @@ template <typename T> class Future {
     using Callback = std::function<void(Result)>;
 
     Future() = default;
-    Future(std::shared_ptr<detail::FutureCompletionState<T>> state, std::function<void()> cancel)
+    Future(std::shared_ptr<detail::FutureCompletionState<T>> state,
+           std::function<void()> cancel) noexcept
         : state_(std::move(state)), cancel_(std::move(cancel)) {}
 
     Future(const Future &) = delete;

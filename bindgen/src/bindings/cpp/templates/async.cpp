@@ -6,12 +6,18 @@ constexpr int8_t UNIFFI_RUST_FUTURE_POLL_WAKE = 1;
 // operation's cancel action, and sends a cancelled result exactly once.
 class ForeignFutureTaskState {
   public:
+    void enqueue_or_cancel(::uniffi::AsyncTask task) noexcept {
+        if (!::uniffi::detail::enqueue_async(std::move(task))) {
+            cancel();
+        }
+    }
+
     void start(const std::shared_ptr<ForeignFutureTaskState> &self) {
         std::lock_guard<std::mutex> guard(mutex_);
         auto weak = std::weak_ptr<ForeignFutureTaskState>(self);
-        operation_id_ = ::uniffi::detail::default_async_dispatcher().track([weak] {
+        operation_id_ = ::uniffi::detail::async_executor().track([weak] {
             if (auto state = weak.lock()) {
-                ::uniffi::detail::dispatch_async([state] { state->cancel(); });
+                state->enqueue_or_cancel([state] { state->cancel(); });
             }
         });
     }
@@ -28,7 +34,7 @@ class ForeignFutureTaskState {
             cancel = std::move(cancel_);
             complete_cancelled = std::move(complete_cancelled_);
         }
-        ::uniffi::detail::default_async_dispatcher().untrack(operation_id_);
+        ::uniffi::detail::async_executor().untrack(operation_id_);
         // Releasing captures can destroy application objects; do it outside the state mutex.
         return true;
     }
@@ -78,7 +84,7 @@ class ForeignFutureTaskState {
         if (complete_cancelled) {
             complete_cancelled();
         }
-        ::uniffi::detail::default_async_dispatcher().untrack(operation_id_);
+        ::uniffi::detail::async_executor().untrack(operation_id_);
     }
 
   private:
@@ -98,9 +104,7 @@ inline void foreign_future_drop(uint64_t handle) noexcept {
     auto state = std::unique_ptr<std::shared_ptr<ForeignFutureTaskState>>(
         reinterpret_cast<std::shared_ptr<ForeignFutureTaskState> *>(handle));
     auto task_state = *state;
-    if (!::uniffi::detail::dispatch_async([task_state] { task_state->cancel(); })) {
-        task_state->cancel();
-    }
+    task_state->enqueue_or_cancel([task_state] { task_state->cancel(); });
 }
 
 template <typename Free> class RustFutureHandleGuard {
@@ -137,20 +141,18 @@ class RustFutureState : public std::enable_shared_from_this<
           error_handler_(std::move(error_handler)), completion_state_(std::move(completion_state)) {
     }
 
-    void start() {
+    bool start() {
         const auto self = this->shared_from_this();
         {
             std::lock_guard<std::mutex> guard(mutex_);
             operation_id_ =
-                ::uniffi::detail::default_async_dispatcher().track([self] { self->cancel(); });
+                ::uniffi::detail::async_executor().track([self] { self->cancel(); });
         }
         if (!operation_id_) {
-            free_(handle_);
-            completion_state_->complete(::uniffi::FutureResult<T>(
-                std::make_exception_ptr(::uniffi::AsyncDispatcherError())));
-            return;
+            return false;
         }
         request_drive();
+        return true;
     }
 
     void cancel() noexcept {
@@ -211,7 +213,7 @@ class RustFutureState : public std::enable_shared_from_this<
             state = this->shared_from_this();
         }
 
-        if (!::uniffi::detail::dispatch_async([state] { state->drive(); })) {
+        if (!::uniffi::detail::enqueue_async([state] { state->drive(); })) {
             // Active operations keep the executor alive until their handles have been released.
             std::terminate();
         }
@@ -302,23 +304,20 @@ class RustFutureState : public std::enable_shared_from_this<
     }
 
     void complete_and_free() noexcept {
-        std::exception_ptr result_error;
-        using StoredResult =
-            std::conditional_t<std::is_void_v<T>, std::monostate, std::optional<T>>;
-        StoredResult result_value{};
-
+        std::optional<::uniffi::FutureResult<T>> result;
         try {
             RustCallStatus status{};
             if constexpr (std::is_void_v<T>) {
                 complete_(handle_, &status);
                 check_rust_call(status, error_handler_);
+                result.emplace();
             } else {
                 auto value = complete_(handle_, &status);
                 check_rust_call(status, error_handler_);
-                result_value.emplace(lift_(value));
+                result.emplace(lift_(value));
             }
         } catch (...) {
-            result_error = std::current_exception();
+            result.emplace(std::current_exception());
         }
 
         std::exception_ptr protocol_failure;
@@ -328,17 +327,12 @@ class RustFutureState : public std::enable_shared_from_this<
         }
 
         free_(handle_);
-        ::uniffi::detail::default_async_dispatcher().untrack(operation_id_);
+        ::uniffi::detail::async_executor().untrack(operation_id_);
 
         if (protocol_failure) {
-            completion_state_->complete(::uniffi::FutureResult<T>(protocol_failure));
-        } else if (result_error) {
-            completion_state_->complete(::uniffi::FutureResult<T>(result_error));
-        } else if constexpr (std::is_void_v<T>) {
-            completion_state_->complete(::uniffi::FutureResult<void>());
-        } else {
-            completion_state_->complete(::uniffi::FutureResult<T>(std::move(*result_value)));
+            result.emplace(std::move(protocol_failure));
         }
+        completion_state_->complete(std::move(*result));
     }
 
     uint64_t handle_;
@@ -368,10 +362,13 @@ Future<T> rust_call_async(RustFuture rust_future, Poll poll, Cancel cancel, Comp
                           Free free, Lift lift, ErrorHandler error_handler) {
     initialize();
     auto completion_state = std::make_shared<::uniffi::detail::FutureCompletionState<T>>();
-    if (!::uniffi::detail::begin_async_call()) {
+    auto rejected = [&completion_state] {
         completion_state->complete(
-            ::uniffi::FutureResult<T>(std::make_exception_ptr(::uniffi::AsyncDispatcherError())));
+            ::uniffi::FutureResult<T>(std::make_exception_ptr(::uniffi::AsyncExecutorError())));
         return Future<T>(std::move(completion_state), nullptr);
+    };
+    if (!::uniffi::detail::begin_async_call()) {
+        return rejected();
     }
 
     const auto handle = rust_future();
@@ -381,13 +378,17 @@ Future<T> rust_call_async(RustFuture rust_future, Poll poll, Cancel cancel, Comp
     auto state =
         std::make_shared<State>(handle, std::move(poll), std::move(cancel), std::move(complete),
                                 free, std::move(lift), std::move(error_handler), completion_state);
-    Future<T> result(completion_state, [weak_state = std::weak_ptr<State>(state)] {
+    // Prepare the callback while the guard owns the handle. Arm Future cancellation after start()
+    // so a registration exception leaves the guard as the only cleanup path.
+    std::function<void()> cancel_future = [weak_state = std::weak_ptr<State>(state)] {
         if (auto state = weak_state.lock()) {
             state->cancel();
         }
-    });
+    };
 
-    state->start();
+    if (!state->start()) {
+        return rejected();
+    }
     handle_guard.release();
-    return result;
+    return Future<T>(std::move(completion_state), std::move(cancel_future));
 }
