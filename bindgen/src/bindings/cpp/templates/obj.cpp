@@ -1,5 +1,6 @@
 {%- let obj = ci.get_object_definition(name).unwrap() %}
 {%- let (interface_name, impl_class_name) = obj|object_names %}
+{%- let foreign_interface_name = interface_name %}
 {%- let class_name = type_name|class_name %}
 {%- let ffi_converter_name = typ|ffi_converter_name %}
 {%- let canonical_type_name = typ|canonical_name %}
@@ -30,37 +31,51 @@ namespace uniffi {
 
 {% match obj.primary_constructor() -%}
 {%- when Some with (ctor) %}
-{%- if !ctor.is_async() %}
-{{ type_name }} {{ impl_class_name }}::init({% call macros::param_list(ctor) %}) {
+{% if ctor.is_async() %}uniffi::Future<{% endif %}{{ type_name }}{% if ctor.is_async() %}>{% endif %} {{ impl_class_name }}::init({% call macros::param_list(ctor) %}) {
+    {%- if ctor.is_async() %}
+    return {% call macros::rust_call_async(ctor, type_name) %};
+    {%- else %}
     return {{ type_name }}(
         new {{ impl_class_name }}({%- call macros::rust_call(ctor) -%})
     );
+    {%- endif %}
 }
-{%- endif %}
 {% else -%}
 {% endmatch -%}
 
 {% for ctor in obj.alternate_constructors() %}
-{%- if !ctor.is_async() %}
-{{ type_name }} {{ impl_class_name }}::{{ ctor.name() }}({% call macros::param_list(ctor) %}) {
+{% if ctor.is_async() %}uniffi::Future<{% endif %}{{ type_name }}{% if ctor.is_async() %}>{% endif %} {{ impl_class_name }}::{{ ctor.name() }}({% call macros::param_list(ctor) %}) {
+    {%- if ctor.is_async() %}
+    return {% call macros::rust_call_async(ctor, type_name) %};
+    {%- else %}
     return {{ type_name }}(new {{ impl_class_name }}({% call macros::rust_call(ctor) %}));
+    {%- endif %}
 }
-{%- endif %}
 {% endfor %}
 
 {%- for method in obj.methods() %}
-{%- if !method.is_async() %}
-{% match method.return_type() %}{% when Some with (return_type) %}{{ return_type|type_name(ci) }} {% else %}void {% endmatch -%}
+{%- let clone_receiver = "this->_uniffi_internal_clone_pointer()" %}
+{% if method.is_async() %}uniffi::Future<{% endif %}{% match method.return_type() %}{% when Some with (return_type) %}{{ return_type|type_name(ci) }}{% else %}void{% endmatch %}{% if method.is_async() %}>{% endif %}
 {{ impl_class_name }}::{{ method.name()|fn_name }}({% call macros::param_list(method) %}) {
-    auto ptr = this->_uniffi_internal_clone_pointer();
+    {# The async start callback clones the receiver only after the executor admission check. #}
+    {%- if !method.is_async() %}
+    auto ptr = {{ clone_receiver }};
+    {%- endif %}
     {%- match method.return_type() %}
     {% when Some with (return_type) %}
+    {%- if method.is_async() %}
+    return {% call macros::rust_call_async_with_prefix(clone_receiver, method, return_type|type_name(ci)) %};
+    {%- else %}
     return uniffi::{{ return_type|lift_fn }}({% call macros::rust_call_with_prefix("ptr", method) %});
+    {%- endif %}
+    {%- else %}
+    {%- if method.is_async() %}
+    return {% call macros::rust_call_async_void_with_prefix(clone_receiver, method) %};
     {%- else %}
     {% call macros::rust_call_with_prefix("ptr", method) -%};
+    {%- endif %}
     {%- endmatch %}
 }
-{%- endif %}
 {%- endfor %}
 
 {{ impl_class_name }}::~{{ impl_class_name }}() {

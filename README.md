@@ -44,11 +44,66 @@ Regardless of the generation method, these files are produced:
 To integrate the bindings into your projects, simply add the generated bindings files to your project.
 C++17 or newer is required to compile the bindings.
 
-# Unsupported features
+# Async functions
 
-The following uniffi features are unsupported.
+UniFFI expects the foreign bindings to provide the scheduler for Rust futures. C++17 provides
+futures for waiting on results, so the generated bindings supply scheduling through `AsyncExecutor`.
+See [why C++ needs an executor](docs/ASYNC_RUNTIME.md#overview).
 
-* Async functions
+Rust async functions, constructors, and methods return a move-only `uniffi::Future<T>`.
+The future supports `get()`, `wait()`, `wait_for()`, `cancel()`, and a consuming `then()` operation.
+Destroying an incomplete future requests cancellation. Cancellation races are resolved by the
+`RustCallStatus` returned by UniFFI completion, so a result that won the race is not discarded.
+Keep the `FutureContinuation` returned by `then()` alive until the callback runs; destroying it
+requests cancellation.
+
+One shared control executor drives all generated components linked into the same C++ library or
+executable. It owns one lazily started, joinable worker thread. Pending calls own state, not threads.
+Rust's waker schedules work only when a future can make progress; there is no polling timer or
+blocking waiter per future. Each future's poll/cancel/complete/free operations are serialized.
+
+Continuations use that same executor:
+
+```cpp
+auto subscription = std::move(service.fetch()).then([](uniffi::FutureResult<Response> result) {
+    try {
+        consume(std::move(result).get());
+    } catch (const std::exception &error) {
+        report(error);
+    }
+});
+```
+
+Keep continuations and foreign callback startup/cancellation actions short and nonblocking. Delegate
+blocking application work to an existing application worker pool or async I/O service. Waiting on an
+incomplete generated future from the control executor throws `std::logic_error` instead of deadlocking.
+
+Stop application producers, then call `uniffi::shutdown_async_executor()` from an application
+thread before unloading the Rust library. Shutdown rejects new C++ calls to async Rust exports
+with `uniffi::AsyncExecutorError`, cancels active calls, drains queued cleanup and continuations,
+and joins the worker. Shutdown is terminal. A nonreturning application callback can prevent
+shutdown from completing.
+
+Async callback-interface methods return `uniffi::ForeignFuture<T>` from their C++ implementation.
+The start function arranges application work, invokes exactly one supplied completion callback, and
+returns a cancellation action:
+
+```cpp
+uniffi::ForeignFuture<Response> fetch(Request request) override {
+    return uniffi::ForeignFuture<Response>(
+        [request = std::move(request)](auto success, auto failure) {
+            return http_pool.start(std::move(request), std::move(success), std::move(failure));
+        }
+    );
+}
+```
+
+Callback startup, cancellation, result delivery and continuations use the shared control executor.
+Completion callbacks may be invoked from any application thread; the bridge defers delivery to Rust.
+The generated bridge arbitrates success, failure, and Rust-side drop exactly once. A dropped Rust
+future invokes the returned cancellation action and closes the UniFFI completion channel.
+
+See [the async runtime design](docs/ASYNC_RUNTIME.md) for handle ownership, scheduling, and shutdown.
 
 # Configuration options
 

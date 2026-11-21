@@ -93,20 +93,6 @@ impl BindingGenerator for CppBindingGenerator {
         components: &[uniffi_bindgen::Component<Self::Config>],
     ) -> Result<()> {
         for Component { ci, config, .. } in components {
-            if ci.has_async_callback_interface_definition() {
-                unimplemented!(
-                    "Cpp bindgen does not support async callback interfaces! Namespace: {}",
-                    ci.namespace()
-                );
-            }
-
-            if ci.has_async_fns() {
-                eprintln!(
-                    "Warning: omitting unsupported async functions from namespace: {}",
-                    ci.namespace()
-                );
-            }
-
             if self.scaffolding_mode {
                 unimplemented!("Cpp scaffolding is not supported yet!");
             } else {

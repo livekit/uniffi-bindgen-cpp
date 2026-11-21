@@ -1,5 +1,6 @@
 mod uniffi_fixtures {
     arithmetical::uniffi_reexport_scaffolding!();
+    uniffi_async_api_client::uniffi_reexport_scaffolding!();
     uniffi_callbacks::uniffi_reexport_scaffolding!();
     custom_types::uniffi_reexport_scaffolding!();
     uniffi_geometry::uniffi_reexport_scaffolding!();
@@ -19,6 +20,7 @@ mod uniffi_fixtures {
     uniffi_empty_type::uniffi_reexport_scaffolding!();
     uniffi_reserved_field_name::uniffi_reexport_scaffolding!();
     uniffi_type_flattening::uniffi_reexport_scaffolding!();
+    uniffi_fixture_async_calls::uniffi_reexport_scaffolding!();
 
     uniffi_ext_types_export::uniffi_reexport_scaffolding!();
     uniffi_ext_types_import::uniffi_reexport_scaffolding!();
