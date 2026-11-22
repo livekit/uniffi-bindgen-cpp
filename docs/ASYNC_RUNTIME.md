@@ -190,6 +190,11 @@ terminal for the binding image. Keep control callbacks short so other calls and 
 progress. [Drain and join][shutdown] · [Continuation registration][registration] ·
 [Callback bridge][callback-results]
 
+The singleton has process lifetime. Returning from `main` or calling `std::exit` leaves pending
+work and its Rust handles to process teardown. Python, Kotlin, and TypeScript UniFFI bindings
+likewise rely on their host runtimes for process exit. Use explicit shutdown before unloading
+the generated bindings or the Rust library. [Singleton lifetime][executor]
+
 [upstream-sequence]: https://mozilla.github.io/uniffi-rs/latest/internals/async-overview.html#rust-async-functions
 [rust-handle-rules]: https://mozilla.github.io/uniffi-rs/latest/internals/async-ffi.html#managing-the-rustfuture-handle
 [foreign-rules]: https://mozilla.github.io/uniffi-rs/latest/internals/async-ffi.html#managing-the-foreignfuture-handle
@@ -199,11 +204,11 @@ progress. [Drain and join][shutdown] · [Continuation registration][registration
 [rust-scheduler]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/rustfuture/scheduler.rs#L80-L84
 [rust-complete]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/rustfuture/future.rs#L162-L179
 [rust-foreign]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/foreignfuture.rs#L67-L99
-[executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L15-L135
+[executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L15-L136
 [drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L205-L288
-[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L392-L497
-[completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L283-L371
-[wait-guard]: ../bindgen/src/bindings/cpp/templates/async.hpp#L146-L152
+[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L393-L498
+[completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L284-L372
+[wait-guard]: ../bindgen/src/bindings/cpp/templates/async.hpp#L147-L153
 [function]: ../bindgen/src/bindings/cpp/templates/fn_def.cpp#L1-L20
 [object]: ../bindgen/src/bindings/cpp/templates/obj.cpp#L32-L78
 [value-methods]: ../bindgen/src/bindings/cpp/templates/value_methods.cpp#L1-L14
@@ -225,4 +230,4 @@ progress. [Drain and join][shutdown] · [Continuation registration][registration
 [foreign-state]: ../bindgen/src/bindings/cpp/templates/async.cpp#L9-L88
 [foreign-drop]: ../bindgen/src/bindings/cpp/templates/async.cpp#L65-L108
 [shutdown]: ../bindgen/src/bindings/cpp/templates/async.hpp#L59-L85
-[registration]: ../bindgen/src/bindings/cpp/templates/async.hpp#L273-L281
+[registration]: ../bindgen/src/bindings/cpp/templates/async.hpp#L274-L282

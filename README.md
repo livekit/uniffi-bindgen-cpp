@@ -79,10 +79,14 @@ blocking application work to an existing application worker pool or async I/O se
 incomplete generated future from the control executor throws `std::logic_error` instead of deadlocking.
 
 Stop application producers, then call `uniffi::shutdown_async_executor()` from an application
-thread before unloading the Rust library. Shutdown rejects new C++ calls to async Rust exports
-with `uniffi::AsyncExecutorError`, cancels active calls, drains queued cleanup and continuations,
-and joins the worker. Shutdown is terminal. A nonreturning application callback can prevent
-shutdown from completing.
+thread before unloading the bindings or the Rust library. Shutdown rejects new calls to async Rust
+exports with `uniffi::AsyncExecutorError`, cancels active calls, drains queued cleanup and
+continuations, and joins the worker. Shutdown is terminal. A nonreturning application callback can
+prevent shutdown from completing.
+
+The shared executor has process lifetime. At process exit, pending work and its Rust handles are
+left to process teardown. Python, Kotlin, and TypeScript UniFFI bindings likewise rely on their
+host runtimes for process exit. Use explicit shutdown when you need to drain outstanding work.
 
 Async callback-interface methods return `uniffi::ForeignFuture<T>` from their C++ implementation.
 The start function arranges application work, invokes exactly one supplied completion callback, and

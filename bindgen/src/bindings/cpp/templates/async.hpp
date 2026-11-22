@@ -130,8 +130,9 @@ class AsyncExecutor {
 };
 
 inline AsyncExecutor &async_executor() {
-    static AsyncExecutor executor;
-    return executor;
+    // Explicit shutdown avoids running callbacks or joining during static destruction.
+    static auto *const executor = new AsyncExecutor();
+    return *executor;
 }
 
 inline bool enqueue_async(AsyncTask task) noexcept {
@@ -154,7 +155,7 @@ inline void check_blocking_wait(bool ready) {
 } // namespace detail
 
 // Cancels in-flight calls, drains their Rust handles and queued completions, and joins the worker.
-// Stop producers first. Call from an application thread, before unloading the Rust library.
+// Stop producers first. Call from an application thread before unloading the bindings or Rust.
 inline void shutdown_async_executor() { detail::async_executor().shutdown(); }
 
 // C++17 adapter for an async callback-interface method. The implementation starts work when the
