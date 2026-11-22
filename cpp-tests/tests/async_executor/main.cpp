@@ -1,5 +1,7 @@
 #include "test_support.hpp"
 
+#include <string>
+
 namespace executor_tests {
 namespace {
 
@@ -75,6 +77,34 @@ void test_executor_shutdown_drains_active_work() {
     }));
     wait_for_future(stopping);
     ASSERT_TRUE(cleaned_up);
+    ASSERT_FALSE(executor.enqueue([] {}));
+}
+
+// A standalone executor restarts with a worker and continues assigning new operation IDs.
+void test_executor_restart() {
+    AsyncExecutor executor;
+    executor.start();
+    const auto previous = executor.track([] {});
+    ASSERT_NE(previous, 0u);
+    executor.untrack(previous);
+    executor.shutdown();
+    ASSERT_FALSE(executor.enqueue([] {}));
+
+    executor.start();
+    executor.start();
+    ASSERT_TRUE(executor.accepting());
+    const auto active = executor.track([] {});
+    ASSERT_TRUE(active > previous);
+
+    bool ran = false;
+    ASSERT_TRUE(executor.enqueue([&] {
+        ASSERT_TRUE(executor.is_worker());
+        executor.start();
+        ran = true;
+        executor.untrack(active);
+    }));
+    executor.shutdown();
+    ASSERT_TRUE(ran);
     ASSERT_FALSE(executor.enqueue([] {}));
 }
 
@@ -197,6 +227,29 @@ void test_singleton_shutdown() {
     uniffi::shutdown_async_executor();
 }
 
+class RestartParser final : public futures::AsyncParserForeign {
+  public:
+    uniffi::ForeignFuture<std::string> stringify(std::int32_t value) override {
+        return uniffi::ForeignFuture<std::string>([value](auto success, auto) {
+            success(std::to_string(value));
+            return nullptr;
+        });
+    }
+    uniffi::ForeignFuture<std::int32_t> parse(const std::string &) override { return {}; }
+    uniffi::ForeignFuture<void> wait() override { return {}; }
+};
+
+// After explicit restart, the singleton can poll Rust and deliver an async C++ callback.
+void test_singleton_restart() {
+    uniffi::start_async_executor();
+    uniffi::start_async_executor();
+    ASSERT_TRUE(wait_for_future(futures::always_ready()));
+    ASSERT_EQ(wait_for_future(futures::stringify_using_parser(std::make_shared<RestartParser>(), 42)),
+              "42");
+    uniffi::shutdown_async_executor();
+    EXPECT_EXCEPTION(wait_for_future(futures::always_ready()), uniffi::AsyncExecutorError);
+}
+
 } // namespace
 } // namespace executor_tests
 
@@ -204,11 +257,14 @@ int main() {
     using namespace executor_tests;
     test_executor_queue();
     test_executor_shutdown_drains_active_work();
+    test_executor_restart();
     test_singleton_across_components();
     test_rust_future_lifecycle();
     test_interleaved_stream_reads();
     test_cancel_pending_read();
-    // Singleton shutdown is terminal for this test process.
+    // Check shutdown rejection before explicitly restarting the singleton.
     test_singleton_shutdown();
     test_foreign_callback_after_shutdown();
+    test_foreign_states_across_restart();
+    test_singleton_restart();
 }

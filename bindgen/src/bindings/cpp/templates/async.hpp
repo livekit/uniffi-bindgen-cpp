@@ -56,6 +56,20 @@ class AsyncExecutor {
 
     bool is_worker() const noexcept { return current_worker_ == this; }
 
+    void start() {
+        if (is_worker()) {
+            // Shutdown may be waiting for this worker to finish.
+            return;
+        }
+        std::lock_guard<std::mutex> shutdown_guard(shutdown_mutex_);
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (stopped_) {
+            worker_ = std::thread([this] { run(); });
+            stopped_ = false;
+            accepting_ = true;
+        }
+    }
+
     void shutdown() {
         if (is_worker()) {
             throw std::logic_error("UniFFI executor cannot shut down from its own callback");
@@ -157,6 +171,9 @@ inline void check_blocking_wait(bool ready) {
 // Cancels in-flight calls, drains their Rust handles and queued completions, and joins the worker.
 // Stop producers first. Call from an application thread before unloading the bindings or Rust.
 inline void shutdown_async_executor() { detail::async_executor().shutdown(); }
+
+// Reopen admission and start a worker after the previous worker has joined.
+inline void start_async_executor() { detail::async_executor().start(); }
 
 // C++17 adapter for an async callback-interface method. The implementation starts work when the
 // generated bridge supplies success and failure callbacks, and returns an optional cancel action.

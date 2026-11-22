@@ -284,4 +284,22 @@ void test_foreign_callback_after_shutdown() {
     Trampoline::uniffi_free(handle);
 }
 
+// A delayed callback startup stays rejected if its state was rejected or cancelled before restart.
+void test_foreign_states_across_restart() {
+    using State = futures::uniffi::ForeignFutureTaskState;
+    auto rejected = std::make_shared<State>();
+    rejected->start(rejected);
+    uniffi::start_async_executor();
+    ASSERT_FALSE(rejected->can_start());
+
+    auto previous = std::make_shared<State>();
+    previous->start(previous);
+    ASSERT_TRUE(previous->can_start());
+    uniffi::shutdown_async_executor();
+    uniffi::start_async_executor();
+    ASSERT_FALSE(previous->can_start());
+    ASSERT_FALSE(previous->finish());
+    uniffi::shutdown_async_executor();
+}
+
 } // namespace executor_tests

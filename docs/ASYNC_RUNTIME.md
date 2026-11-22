@@ -18,8 +18,9 @@ C++ callback methods that Rust awaits.
   application threads. [Continuation delivery][completion] · [Wait guard][wait-guard]
 - **Async C++ callbacks.** When Rust awaits a C++ `ForeignFuture<T>`, the worker starts the
   callback and delivers its result or handles cancellation. [Callback bridge][callback-results]
-- **Shutdown.** Call `shutdown_async_executor()` from an application thread to stop admission,
-  cancel outstanding work, drain the queue, and join the worker. [Shutdown][shutdown]
+- **Shutdown and restart.** Call `shutdown_async_executor()` from an application thread to stop
+  admission, cancel outstanding work, drain the queue, and join the worker. Call
+  `start_async_executor()` to reopen admission. [Shutdown][shutdown] · [Restart][restart]
 
 The sequence adapts the [UniFFI Async Overview][upstream-sequence] to the C++ executor.
 
@@ -183,11 +184,15 @@ gate, a later drop just releases the C++ handle.
 
 Stop producers before calling `shutdown_async_executor()` from an application thread. The executor
 closes admission, requests cancellation for registered calls, drains the queue and in-flight work,
-and joins the worker. New C++ calls to async Rust exports receive `AsyncExecutorError` after
-shutdown. The callback trampoline reports cancellation to Rust if the executor rejects startup.
-Continuation delivery retains its own registration until its callback is released. Shutdown is
-terminal for the binding image. Keep control callbacks short so other calls and shutdown can make
-progress. [Drain and join][shutdown] · [Continuation registration][registration] ·
+and joins the worker. Continuation delivery retains its own registration until its callback is
+released. Keep control callbacks short so other calls and shutdown can make progress.
+[Drain and join][shutdown] · [Continuation registration][registration]
+
+New C++ calls to async Rust exports receive `AsyncExecutorError` until an application thread calls
+`start_async_executor()`. Start waits for any concurrent shutdown to finish joining the worker,
+then opens admission. Calling start on a running executor is harmless. Operation IDs continue
+increasing across restarts. The callback trampoline checks admission and its own state before it
+starts work, so rejected or retired callbacks stay inactive after restart. [Restart][restart] ·
 [Callback bridge][callback-results]
 
 The singleton has process lifetime. Returning from `main` or calling `std::exit` leaves pending
@@ -204,30 +209,31 @@ the generated bindings or the Rust library. [Singleton lifetime][executor]
 [rust-scheduler]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/rustfuture/scheduler.rs#L80-L84
 [rust-complete]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/rustfuture/future.rs#L162-L179
 [rust-foreign]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/foreignfuture.rs#L67-L99
-[executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L15-L136
-[drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L205-L288
-[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L393-L498
-[completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L284-L372
-[wait-guard]: ../bindgen/src/bindings/cpp/templates/async.hpp#L147-L153
+[executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L15-L150
+[drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L210-L293
+[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L410-L515
+[completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L301-L389
+[wait-guard]: ../bindgen/src/bindings/cpp/templates/async.hpp#L161-L167
 [function]: ../bindgen/src/bindings/cpp/templates/fn_def.cpp#L1-L20
 [object]: ../bindgen/src/bindings/cpp/templates/obj.cpp#L32-L78
 [value-methods]: ../bindgen/src/bindings/cpp/templates/value_methods.cpp#L1-L14
 [flat-enum-methods]: ../bindgen/src/bindings/cpp/templates/flat_enum_methods.cpp#L1-L14
 [macros]: ../bindgen/src/bindings/cpp/templates/macros.cpp#L69-L164
 [init]: ../bindgen/src/bindings/cpp/templates/wrapper.cpp#L13-L37
-[handle-guard]: ../bindgen/src/bindings/cpp/templates/async.cpp#L110-L129
-[state-start]: ../bindgen/src/bindings/cpp/templates/async.cpp#L144-L183
-[poll]: ../bindgen/src/bindings/cpp/templates/async.cpp#L290-L294
-[continuation]: ../bindgen/src/bindings/cpp/templates/async.cpp#L179-L203
-[next-action]: ../bindgen/src/bindings/cpp/templates/async.cpp#L222-L241
-[finish]: ../bindgen/src/bindings/cpp/templates/async.cpp#L306-L336
+[handle-guard]: ../bindgen/src/bindings/cpp/templates/async.cpp#L115-L134
+[state-start]: ../bindgen/src/bindings/cpp/templates/async.cpp#L149-L188
+[poll]: ../bindgen/src/bindings/cpp/templates/async.cpp#L295-L299
+[continuation]: ../bindgen/src/bindings/cpp/templates/async.cpp#L184-L208
+[next-action]: ../bindgen/src/bindings/cpp/templates/async.cpp#L227-L246
+[finish]: ../bindgen/src/bindings/cpp/templates/async.cpp#L311-L341
 [status]: ../bindgen/src/bindings/cpp/templates/wrapper.cpp#L40-L64
-[call-async]: ../bindgen/src/bindings/cpp/templates/async.cpp#L359-L394
-[cancel]: ../bindgen/src/bindings/cpp/templates/async.cpp#L296-L304
+[call-async]: ../bindgen/src/bindings/cpp/templates/async.cpp#L364-L399
+[cancel]: ../bindgen/src/bindings/cpp/templates/async.cpp#L301-L309
 [callback-api]: ../bindgen/src/bindings/cpp/templates/callback.hpp#L6-L35
 [callback-entry]: ../bindgen/src/bindings/cpp/templates/callback_iface_tmpl.cpp#L7-L22
 [callback-results]: ../bindgen/src/bindings/cpp/templates/callback_iface_tmpl.cpp#L24-L140
-[foreign-state]: ../bindgen/src/bindings/cpp/templates/async.cpp#L9-L88
-[foreign-drop]: ../bindgen/src/bindings/cpp/templates/async.cpp#L65-L108
-[shutdown]: ../bindgen/src/bindings/cpp/templates/async.hpp#L59-L85
-[registration]: ../bindgen/src/bindings/cpp/templates/async.hpp#L274-L282
+[foreign-state]: ../bindgen/src/bindings/cpp/templates/async.cpp#L9-L93
+[foreign-drop]: ../bindgen/src/bindings/cpp/templates/async.cpp#L70-L113
+[shutdown]: ../bindgen/src/bindings/cpp/templates/async.hpp#L73-L99
+[restart]: ../bindgen/src/bindings/cpp/templates/async.hpp#L59-L71
+[registration]: ../bindgen/src/bindings/cpp/templates/async.hpp#L291-L299

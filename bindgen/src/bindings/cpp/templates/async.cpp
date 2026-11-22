@@ -22,6 +22,11 @@ class ForeignFutureTaskState {
         });
     }
 
+    bool can_start() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return operation_id_ != 0 && !finished_;
+    }
+
     bool finish() noexcept {
         std::function<void()> cancel;
         std::function<void()> complete_cancelled;

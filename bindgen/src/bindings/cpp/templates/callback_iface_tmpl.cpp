@@ -115,7 +115,7 @@
             state, obj, complete_success, complete_failure
             {%- for arg in method.arguments() %}, arg{{ loop.index0 }} = std::move(arg{{ loop.index0 }}){% endfor %}
         ]() mutable {
-            if (!::uniffi::detail::begin_async_call()) {
+            if (!::uniffi::detail::begin_async_call() || !state->can_start()) {
                 state->cancel();
                 return;
             }
