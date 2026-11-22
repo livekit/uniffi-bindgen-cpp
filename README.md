@@ -54,8 +54,11 @@ Rust async functions, constructors, and methods return a move-only `uniffi::Futu
 The future supports `get()`, `wait()`, `wait_for()`, `cancel()`, and a consuming `then()` operation.
 Destroying an incomplete future requests cancellation. Cancellation races are resolved by the
 `RustCallStatus` returned by UniFFI completion, so a result that won the race is not discarded.
-Keep the `FutureContinuation` returned by `then()` alive until the callback runs; destroying it
-requests cancellation.
+Keep the `FutureContinuation` returned by `then()` alive until the callback runs. Destroying it
+requests cancellation. Access each `Future` or `FutureContinuation` from one thread at a time.
+For cross-thread cancellation, take a copyable `FutureCancelHandle` with `future.cancel_handle()`
+before calling `get()` or `then()`. The handle's `cancel()` can run while `get()` is blocked, and
+has no effect after completion.
 
 One shared control executor drives all generated components linked into the same C++ library or
 executable. It owns one lazily started, joinable worker thread. Pending calls own state, not threads.

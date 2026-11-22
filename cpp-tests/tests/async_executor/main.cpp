@@ -202,6 +202,49 @@ void test_cancel_pending_read() {
     ASSERT_EQ(wait_for_future(stream->next()), std::optional<std::uint32_t>(42));
 }
 
+// A separate cancellation handle releases a thread waiting in get().
+void test_cancel_blocking_get() {
+    auto pending = futures::pending();
+    const auto cancel = pending.cancel_handle();
+    auto entering = std::make_shared<std::promise<void>>();
+    auto entering_get = entering->get_future();
+    auto waiter = std::async(std::launch::async, [pending = std::move(pending), entering]() mutable {
+        entering->set_value();
+        EXPECT_EXCEPTION(pending.get(), uniffi::AsyncCancelledError);
+    });
+
+    wait_for_future(entering_get);
+    ASSERT_EQ(waiter.wait_for(20ms), std::future_status::timeout);
+    const auto copy = cancel;
+    copy.cancel();
+    wait_for_future(waiter);
+    cancel.cancel();
+}
+
+// Handles survive completion, destruction of a future, and transfer into then().
+void test_cancel_handle_lifetime() {
+    uniffi::FutureCancelHandle finished;
+    {
+        auto ready = futures::always_ready();
+        finished = ready.cancel_handle();
+        ASSERT_TRUE(wait_for_future(ready));
+        finished.cancel();
+    }
+    finished.cancel();
+
+    auto pending = futures::pending();
+    const auto cancel = pending.cancel_handle();
+    auto delivered = std::make_shared<std::promise<void>>();
+    auto result = delivered->get_future();
+    auto continuation = std::move(pending).then([delivered](auto completed) {
+        EXPECT_EXCEPTION(completed.get(), uniffi::AsyncCancelledError);
+        delivered->set_value();
+    });
+    wait_for_queued_work(async_executor());
+    cancel.cancel();
+    wait_for_future(result);
+}
+
 // Shutdown delivers cancellation, rejects new reads, and allows the Rust receiver to drop.
 void test_singleton_shutdown() {
     ASSERT_EQ(futures::sample_stream_count(), 0u);
@@ -262,6 +305,8 @@ int main() {
     test_rust_future_lifecycle();
     test_interleaved_stream_reads();
     test_cancel_pending_read();
+    test_cancel_blocking_get();
+    test_cancel_handle_lifetime();
     // Check shutdown rejection before explicitly restarting the singleton.
     test_singleton_shutdown();
     test_foreign_callback_after_shutdown();

@@ -82,6 +82,12 @@ the worker. Hold that token until delivery or cancel it to request cancellation.
 threads may block on an incomplete call. The worker can inspect readiness or consume a ready result.
 [Future API][future] · [Completion state][completion] · [Worker wait guard][wait-guard]
 
+Access each `Future<T>` or `FutureContinuation` from one thread at a time. Before calling `get()`
+or `then()`, use `cancel_handle()` to obtain a copyable `FutureCancelHandle` for a different thread.
+The handle can request cancellation while `get()` waits or after `then()` takes ownership. Its
+weak reference keeps cancellation harmless after completion. [Cancel handle][cancel-handle] ·
+[Rust cancellation state][state-start]
+
 ## C++ calls an async Rust export
 
 The generator uses the same driver for free functions, primary and secondary constructors, and
@@ -211,7 +217,8 @@ the generated bindings or the Rust library. [Singleton lifetime][executor]
 [rust-foreign]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/foreignfuture.rs#L67-L99
 [executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L15-L150
 [drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L210-L293
-[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L410-L515
+[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L429-L547
+[cancel-handle]: ../bindgen/src/bindings/cpp/templates/async.hpp#L410-L427
 [completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L301-L389
 [wait-guard]: ../bindgen/src/bindings/cpp/templates/async.hpp#L161-L167
 [function]: ../bindgen/src/bindings/cpp/templates/fn_def.cpp#L1-L20

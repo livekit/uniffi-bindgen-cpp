@@ -407,6 +407,25 @@ template <> inline void FutureCompletionState<void>::get() {
 
 } // namespace detail
 
+class FutureCancelHandle {
+  public:
+    FutureCancelHandle() = default;
+
+    void cancel() const noexcept {
+        if (cancel_) {
+            cancel_();
+        }
+    }
+
+  private:
+    template <typename T> friend class Future;
+
+    explicit FutureCancelHandle(std::function<void()> cancel) noexcept
+        : cancel_(std::move(cancel)) {}
+
+    std::function<void()> cancel_;
+};
+
 class FutureContinuation {
   public:
     FutureContinuation() = default;
@@ -473,6 +492,8 @@ template <typename T> class Future {
     ~Future() { cancel(); }
 
     bool valid() const noexcept { return state_ != nullptr; }
+
+    [[nodiscard]] FutureCancelHandle cancel_handle() const { return FutureCancelHandle(cancel_); }
 
     decltype(auto) get() {
         require_state();
