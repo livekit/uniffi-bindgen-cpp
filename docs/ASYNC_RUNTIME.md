@@ -9,18 +9,20 @@ C++ callback methods that Rust awaits.
 
 - **One worker thread.** Generated components in each linked executable or shared library share a
   worker and a FIFO queue. [Executor][executor]
-- **UniFFI Rust future calls.** The wrapper obtains the future handle on the caller's thread.
-  The worker calls `rust_future_poll` and repolls on `WAKE`. On `READY` it calls
-  `rust_future_complete` to collect the value or error, then `rust_future_free` to release the
-  handle. It requests cancellation with `rust_future_cancel`. [UniFFI handle rules][rust-handle-rules]
+- **UniFFI Rust future calls.** The wrapper obtains the future handle and normally calls
+  `rust_future_poll` on the calling thread. If that poll reports `READY`, the wrapper calls
+  `rust_future_complete` and `rust_future_free` there before returning `Future<T>`. The worker
+  polls deferred calls, repolls on `WAKE`, calls `rust_future_cancel` to cancel, and completes and
+  frees the remaining handles. [First poll][state-start] · [UniFFI handle rules][rust-handle-rules]
 - **Pending calls and continuations.** The worker can run other tasks while a future waits for a
   wake. C++ continuations run on the worker, so keep them short and do blocking waits on
   application threads. [Continuation delivery][completion] · [Wait guard][wait-guard]
 - **Async C++ callbacks.** When Rust awaits a C++ `ForeignFuture<T>`, the worker starts the
   callback and delivers its result or handles cancellation. [Callback bridge][callback-results]
-- **Shutdown and restart.** Call `shutdown_async_executor()` from an application thread to stop
-  admission, cancel outstanding work, drain the queue, and join the worker. Call
-  `start_async_executor()` to reopen admission. [Shutdown][shutdown] · [Restart][restart]
+- **Shutdown and restart.** Call `shutdown_async_executor()` from an application thread to wait
+  for caller-thread first polls, close admission, cancel outstanding work, drain the queue, and
+  join the worker. Call `start_async_executor()` to reopen admission.
+  [Shutdown][shutdown] · [Restart][restart]
 
 The sequence adapts the [UniFFI Async Overview][upstream-sequence] to the C++ executor.
 
@@ -35,44 +37,71 @@ sequenceDiagram
     B->>R: call scaffolding function
     R-->>B: return RustFuture handle
     B->>B: Register RustFutureState with the executor
-    B->>E: Queue drive() for the first poll
+    alt Caller-thread first poll admitted
+        B->>R: rust_future_poll(handle, continuation, state)
+        alt READY on the first poll
+            R->>B: continuation(state, READY)
+            R-->>B: Return from poll
+            B->>R: rust_future_complete(handle, &status)
+            R-->>B: Lowered result and RustCallStatus
+            B->>B: Check status and lift value
+            B->>R: rust_future_free(handle)
+            B->>B: Publish result and untrack the call
+        else Pending on the first poll
+            Note over B,R: WAKE may arrive during or after the poll
+            R-->>B: Return from poll
+        end
+    else Shutdown is waiting for caller-thread polls
+        B->>E: Queue the first poll
+    end
     B-->>C: Return Future
 
-    loop One outstanding poll until READY
-        E->>R: rust_future_poll(handle, continuation, state)
-        alt WAKE
-            Note over E: The worker can run other tasks<br/>while this future waits for a wake
+    opt Call is pending or its first poll was queued
+        opt Pending after a caller-thread poll
             R->>B: continuation(state, WAKE)
-            B->>E: Request another poll
-        else READY
-            R->>B: continuation(state, READY)
-            B->>B: Record readiness
+            B->>E: Schedule the driver after the first poll returns
         end
+        loop One outstanding poll until READY
+            E->>R: rust_future_poll(handle, continuation, state)
+            alt WAKE
+                Note over E: The worker can run other tasks while the future waits
+                R->>B: continuation(state, WAKE)
+                B->>E: Request another poll
+            else READY
+                R->>B: continuation(state, READY)
+                B->>B: Record readiness
+            end
+        end
+        E->>R: rust_future_complete(handle, &status)
+        R-->>E: Lowered result and RustCallStatus
+        E->>E: Check status and lift value
+        E->>R: rust_future_free(handle)
+        E->>B: Publish to FutureCompletionState
+        E->>E: Untrack the call
     end
-
-    E->>R: rust_future_complete(handle, &status)
-    R-->>E: Lowered result and RustCallStatus
-    E->>E: Check status and lift value
-    E->>R: rust_future_free(handle)
-    E->>E: Untrack the call
-    E->>B: Publish to FutureCompletionState
     Note over C,E: get() reads the result or throws<br/>then() delivers on the worker
 ```
 
 ## Execution model
 
 The `async_executor()` singleton creates a joinable worker on first use. The worker takes short
-tasks from a FIFO queue and sleeps on a condition variable when the queue is empty. Pending Rust
-futures retain their state and wake callback. Each driver runs at most 64 actions per turn before
-yielding to the queue. [Executor][executor] · [Driver][drive]
+tasks from a FIFO queue and sleeps on a condition variable when the queue is empty. The caller
+normally runs the first poll before the wrapper returns. Rust code through its first suspension
+or completion, including synchronous C++ callbacks it invokes, blocks the calling thread.
+Pending Rust futures retain their state and wake callback. Each worker turn runs at most 64
+driver actions before yielding to the queue. [Executor][executor] · [First poll][state-start] ·
+[Driver][drive]
 
 ```mermaid
 flowchart LR
-    A[Application thread] -->|Schedule driver| Q[Control queue]
+    A[Application thread] -->|First poll, complete and free if ready| R[Rust scaffolding]
+    A -->|Publish ready result| F[C++ future]
+    A -->|Queue first poll during shutdown wait| Q[Control queue]
     Q --> W[One C++ worker]
-    W -->|Poll or finish| R[Rust scaffolding]
+    W -->|Poll, cancel or finish| R
     R -->|Wake callback| Q
-    W -->|Publish result| F[C++ future or continuation]
+    W -->|Publish result| F
+    W -->|Deliver| T[C++ continuation]
 ```
 
 A move-only `Future<T>` supports `wait()`, `wait_for()`, `get()`, `cancel()`, and a consuming
@@ -103,23 +132,28 @@ an out pointer on completion. [Function template][function] · [Object template]
 
 - **Create a handle and poll with a callback and opaque data.** `rust_call_async` gives the acquired
   handle to a scope guard. `start()` registers shared ownership of `RustFutureState` with the
-  executor and schedules the first poll. The poll passes the state's address as callback data.
-  The callback takes a strong reference to the state on entry.
+  executor. `run_inline()` normally calls `poll_first_turn()` before the wrapper returns
+  `Future<T>`. While shutdown waits for caller-thread polls, `start()` queues the first poll on
+  the worker. The poll passes the state's address as callback data, and the callback takes a
+  strong reference to the state on entry.
   [Handle guard][handle-guard] · [Start and callback lifetime][state-start] · [Poll][poll]
 - **Poll again on `WAKE` and complete on `READY`.** The callback clears `poll_outstanding_` and
   records `poll_requested_` for `WAKE` (`1`) or `ready_` for `READY` (`0`) under the state mutex.
-  `next_action()` sets `poll_outstanding_` before invoking Rust and admits another poll only after
-  that callback. Rust guarantees one callback per poll, which can arrive from another thread.
+  `start()` sets `poll_outstanding_` for a caller-thread poll. `next_action()` sets it for worker
+  polls and admits another poll only after the callback. Rust guarantees one callback per poll,
+  which can arrive from another thread.
   [C++ state transitions][continuation] · [Rust poll guarantee][rust-poll]
-- **Complete once and stop polling.** `next_action()` gives `READY` priority and sets `terminal_`
-  before returning `CompleteFuture`. That flag closes the driver, callback, and cancellation paths.
-  The worker completes once, checks `RustCallStatus`, and lifts the value on success.
-  [Action selection][next-action] · [Result conversion][finish] · [Status handling][status]
-- **Free the handle as the last FFI operation.** The driver frees the handle before removing the
-  registry entry and publishing the result. Status, lifting, and result-transfer failures are
-  stored as exceptions for the caller. The scope guard owns the handle until registration
-  succeeds. It frees the handle if registration fails, including when admission closes during
-  handle creation. The wrapper arms `Future<T>` cancellation after successful registration.
+- **Complete once and stop polling.** `poll_first_turn()` and `next_action()` give `READY` priority
+  and set `terminal_` before completion. That flag closes the driver, callback, and cancellation
+  paths. Completion checks `RustCallStatus` and lifts the value on success. A ready first poll
+  completes on the caller. The worker completes pending and deferred calls.
+  [First poll][state-start] · [Action selection][next-action] · [Result conversion][finish] ·
+  [Status handling][status]
+- **Free the handle as the last FFI operation.** The driver frees the handle, publishes the result,
+  then removes the registry entry. Status, lifting, and result-transfer failures are stored as
+  exceptions for the caller. The scope guard owns the handle until registration succeeds. It
+  frees the handle if registration fails, including when admission closes during handle creation.
+  The wrapper arms `Future<T>` cancellation after successful registration.
   [Completion and free][finish] · [Guard and handoff][call-async] · [Admission race][state-start]
 - **Serialize optional cancellation with the rest of the lifecycle.** `cancel()` and token
   destruction request work on the driver. It sends at most one `rust_future_cancel`. After the
@@ -190,9 +224,12 @@ gate, a later drop just releases the C++ handle.
 ## Shutdown
 
 Stop producers before calling `shutdown_async_executor()` from an application thread. The executor
-closes admission, requests cancellation for registered calls, drains the queue and in-flight work,
-and joins the worker. Continuation delivery retains its own registration until its callback is
-released. Keep control callbacks short so other calls and shutdown can make progress.
+first waits for caller-thread first polls to finish with admission open. Calls that start during
+that wait queue their first poll on the worker. A blocked first poll delays shutdown. After the
+caller-thread polls finish, the executor closes admission, requests cancellation for registered
+calls, drains the queue and in-flight work, and joins the worker. Continuation delivery retains its
+own registration until its callback is released. Keep control callbacks short so other calls and
+shutdown can make progress.
 [Drain and join][shutdown] · [Continuation registration][registration]
 
 Once admission closes, the driver sends cancellation before polling a pending Rust future.
@@ -206,6 +243,10 @@ then opens admission. Calling start on a running executor is harmless. Operation
 increasing across restarts. The callback trampoline checks admission and its own state before it
 starts work, so rejected or retired callbacks stay inactive after restart. [Restart][restart] ·
 [Callback bridge][callback-results]
+
+On the worker or inside a caller-thread first poll, `shutdown_async_executor()` throws
+`std::logic_error` and `start_async_executor()` returns immediately.
+[Shutdown guard][shutdown] · [Start guard][restart]
 
 The singleton has process lifetime. Returning from `main` or calling `std::exit` leaves pending
 work and its Rust handles to process teardown. Python, Kotlin, and TypeScript UniFFI bindings
@@ -238,32 +279,32 @@ method or when conversion to the declared error type fails. [Result handling][ru
 [rust-foreign-return]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi_converter_traits.rs#L357-L395
 [rust-foreign-result]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi_converter_impls.rs#L516-L540
 [rust-callback-conversion]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/callbackinterface.rs#L150-L210
-[executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L15-L150
-[drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L210-L296
-[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L429-L547
-[cancel-handle]: ../bindgen/src/bindings/cpp/templates/async.hpp#L410-L427
-[completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L301-L389
-[wait-guard]: ../bindgen/src/bindings/cpp/templates/async.hpp#L161-L167
-[function]: ../bindgen/src/bindings/cpp/templates/fn_def.cpp#L1-L20
-[object]: ../bindgen/src/bindings/cpp/templates/obj.cpp#L32-L78
+[executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L17-L176
+[drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L236-L322
+[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L416-L536
+[cancel-handle]: ../bindgen/src/bindings/cpp/templates/async.hpp#L397-L414
+[completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L308-L393
+[wait-guard]: ../bindgen/src/bindings/cpp/templates/async.hpp#L189-L193
+[function]: ../bindgen/src/bindings/cpp/templates/fn_def.cpp#L1-L14
+[object]: ../bindgen/src/bindings/cpp/templates/obj.cpp#L32-L72
 [value-methods]: ../bindgen/src/bindings/cpp/templates/value_methods.cpp#L1-L14
 [flat-enum-methods]: ../bindgen/src/bindings/cpp/templates/flat_enum_methods.cpp#L1-L14
-[macros]: ../bindgen/src/bindings/cpp/templates/macros.cpp#L69-L164
+[macros]: ../bindgen/src/bindings/cpp/templates/macros.cpp#L69-L102
 [init]: ../bindgen/src/bindings/cpp/templates/wrapper.cpp#L13-L37
-[handle-guard]: ../bindgen/src/bindings/cpp/templates/async.cpp#L115-L134
-[state-start]: ../bindgen/src/bindings/cpp/templates/async.cpp#L149-L188
-[poll]: ../bindgen/src/bindings/cpp/templates/async.cpp#L298-L302
-[continuation]: ../bindgen/src/bindings/cpp/templates/async.cpp#L184-L208
-[next-action]: ../bindgen/src/bindings/cpp/templates/async.cpp#L227-L249
-[finish]: ../bindgen/src/bindings/cpp/templates/async.cpp#L314-L344
-[status]: ../bindgen/src/bindings/cpp/templates/wrapper.cpp#L40-L64
-[call-async]: ../bindgen/src/bindings/cpp/templates/async.cpp#L367-L402
-[cancel]: ../bindgen/src/bindings/cpp/templates/async.cpp#L304-L312
-[callback-api]: ../bindgen/src/bindings/cpp/templates/callback.hpp#L6-L35
+[handle-guard]: ../bindgen/src/bindings/cpp/templates/async.cpp#L117-L137
+[state-start]: ../bindgen/src/bindings/cpp/templates/async.cpp#L145-L208
+[poll]: ../bindgen/src/bindings/cpp/templates/async.cpp#L324-L328
+[continuation]: ../bindgen/src/bindings/cpp/templates/async.cpp#L210-L234
+[next-action]: ../bindgen/src/bindings/cpp/templates/async.cpp#L253-L275
+[finish]: ../bindgen/src/bindings/cpp/templates/async.cpp#L340-L402
+[status]: ../bindgen/src/bindings/cpp/templates/wrapper.cpp#L40-L66
+[call-async]: ../bindgen/src/bindings/cpp/templates/async.cpp#L410-L445
+[cancel]: ../bindgen/src/bindings/cpp/templates/async.cpp#L330-L338
+[callback-api]: ../bindgen/src/bindings/cpp/templates/callback.hpp#L6-L37
 [callback-entry]: ../bindgen/src/bindings/cpp/templates/callback_iface_tmpl.cpp#L7-L22
 [callback-results]: ../bindgen/src/bindings/cpp/templates/callback_iface_tmpl.cpp#L24-L140
-[foreign-state]: ../bindgen/src/bindings/cpp/templates/async.cpp#L9-L93
+[foreign-state]: ../bindgen/src/bindings/cpp/templates/async.cpp#L7-L102
 [foreign-drop]: ../bindgen/src/bindings/cpp/templates/async.cpp#L70-L113
-[shutdown]: ../bindgen/src/bindings/cpp/templates/async.hpp#L73-L99
-[restart]: ../bindgen/src/bindings/cpp/templates/async.hpp#L59-L71
-[registration]: ../bindgen/src/bindings/cpp/templates/async.hpp#L291-L299
+[shutdown]: ../bindgen/src/bindings/cpp/templates/async.hpp#L92-L123
+[restart]: ../bindgen/src/bindings/cpp/templates/async.hpp#L78-L90
+[registration]: ../bindgen/src/bindings/cpp/templates/async.hpp#L298-L306
