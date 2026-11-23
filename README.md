@@ -107,11 +107,18 @@ uniffi::ForeignFuture<Response> fetch(Request request) override {
 ```
 
 Callback startup, cancellation, result delivery and continuations use the shared control executor.
-Completion callbacks may be invoked from any application thread; the bridge defers delivery to Rust.
+The C++ implementation can invoke the supplied success or failure callback from any thread. While
+the executor is running, the bridge queues delivery to Rust.
 The generated bridge arbitrates success, failure, and Rust-side drop exactly once. A dropped Rust
 future invokes the returned cancellation action and closes the UniFFI completion channel.
 
-See [the async runtime design](docs/ASYNC_RUNTIME.md) for handle ownership, scheduling, and shutdown.
+When shutdown cancels or rejects a C++ callback that a Rust-owned task is still awaiting, UniFFI
+treats the result as an unexpected callback error. A trait method returning `Result<T, E>` can
+receive it as `Err` if `E` implements `From<uniffi::UnexpectedUniFFICallbackError>`. UniFFI panics
+when the conversion is unavailable.
+
+See the [async runtime design](docs/ASYNC_RUNTIME.md#rust-owned-tasks-during-shutdown) for callback
+shutdown, handle ownership, and scheduling.
 
 # Configuration options
 

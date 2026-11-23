@@ -146,7 +146,8 @@ function accepts success and failure callbacks and returns an optional cancellat
 FFI vtable, the method returns `void` and accepts a completion function, its original `uint64_t`
 context, and an output slot for the drop callback. The trampoline fills the drop slot, lifts the
 arguments, and queues startup. Application code can arrange blocking work on an application
-worker and signal completion from that worker. [C++ callback surface][callback-api] ·
+worker and invoke the supplied success or failure callback from any thread.
+[C++ callback surface][callback-api] ·
 [Vtable trampoline][callback-entry] · [Upstream async API client][api-client]
 
 ```mermaid
@@ -211,6 +212,19 @@ work and its Rust handles to process teardown. Python, Kotlin, and TypeScript Un
 likewise rely on their host runtimes for process exit. Use explicit shutdown before unloading
 the generated bindings or the Rust library. [Singleton lifetime][executor]
 
+### Rust-owned tasks during shutdown
+
+A task driven by a Rust runtime can still be awaiting a C++ callback when shutdown cancels it or
+rejects its startup. The bridge completes the callback with status code 3 and an empty error
+buffer. UniFFI lifts that status through the same branch as code 2, creating an
+`UnexpectedUniFFICallbackError`. [Callback cancellation status][callback-entry] ·
+[UniFFI status handling][rust-foreign-return]
+
+To receive this as an `Err` in Rust, declare the trait method with a `Result<T, E>` return and
+implement `From<uniffi::UnexpectedUniFFICallbackError>` for `E`. UniFFI panics for an infallible
+method or when conversion to the declared error type fails. [Result handling][rust-foreign-result] ·
+[Error conversion][rust-callback-conversion]
+
 [upstream-sequence]: https://mozilla.github.io/uniffi-rs/latest/internals/async-overview.html#rust-async-functions
 [rust-handle-rules]: https://mozilla.github.io/uniffi-rs/latest/internals/async-ffi.html#managing-the-rustfuture-handle
 [foreign-rules]: https://mozilla.github.io/uniffi-rs/latest/internals/async-ffi.html#managing-the-foreignfuture-handle
@@ -220,6 +234,9 @@ the generated bindings or the Rust library. [Singleton lifetime][executor]
 [rust-scheduler]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/rustfuture/scheduler.rs#L80-L84
 [rust-complete]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/rustfuture/future.rs#L162-L179
 [rust-foreign]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/foreignfuture.rs#L67-L99
+[rust-foreign-return]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi_converter_traits.rs#L357-L395
+[rust-foreign-result]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi_converter_impls.rs#L516-L540
+[rust-callback-conversion]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/callbackinterface.rs#L150-L193
 [executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L15-L150
 [drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L210-L296
 [future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L429-L547
