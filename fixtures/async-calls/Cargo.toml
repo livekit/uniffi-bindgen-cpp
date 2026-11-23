@@ -1,0 +1,16 @@
+[package]
+name = "uniffi-async-calls"
+version = "0.21.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+name = "uniffi_fixture_async_calls"
+crate-type = ["lib"]
+
+[dependencies]
+futures-timer = "3.0"
+thiserror = "1.0"
+tokio = { version = "1.24.1", features = ["rt", "sync"] }
+uniffi = { workspace = true, features = ["tokio"] }

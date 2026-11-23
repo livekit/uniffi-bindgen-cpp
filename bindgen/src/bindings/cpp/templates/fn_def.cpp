@@ -1,12 +1,14 @@
-{%- match func.return_type() %}
-{%- when Some with (return_type) %}
-{{ return_type|type_name(ci) }} {{ func.name()|fn_name }}({% call macros::param_list(func) %}) {
+{% call macros::callable_return_type(func) %} {{ func.name()|fn_name }}({% call macros::param_list(func) %}) {
+    {%- if func.is_async() %}
+    return {% call macros::rust_call_async(func, "") %};
+    {%- else %}
+    {%- match func.return_type() %}
+    {%- when Some with (return_type) %}
     auto ret = {% call macros::rust_call(func) %};
 
     return uniffi::{{ return_type|lift_fn }}(ret);
-}
-{%- when None -%}
-void {{ func.name()|fn_name }}({% call macros::param_list(func) %}) {
+    {%- when None %}
     {% call macros::rust_call(func) %};
+    {%- endmatch %}
+    {%- endif %}
 }
-{%- endmatch -%}

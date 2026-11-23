@@ -21,7 +21,7 @@ set(BINDINGS_SRC_DIR ${BINDINGS_BUILD_DIR}/bindings)
 
 if (WIN32)
     set(UNIFFI_FIXTURES_LIB uniffi_bindgen_cpp_fixtures.dll)
-    set(ADDITIONAL_LIBS ws2_32 userenv advapi32 ntdll crypt32 Bcrypt)
+    set(ADDITIONAL_LIBS ws2_32 userenv advapi32 ntdll crypt32 Bcrypt synchronization)
 elseif(UNIX AND NOT APPLE)
     set(UNIFFI_FIXTURES_LIB libuniffi_bindgen_cpp_fixtures.so)
     set(ADDITIONAL_LIBS)
@@ -65,9 +65,14 @@ if(VALGRIND)
     set_tests_properties(async_exit_from_continuation-test-test-memcheck PROPERTIES TIMEOUT 30)
 endif()
 
-# Add a bindings test case
+# Additional sources can supply the generated bindings for tests that reuse a fixture.
 macro(test_case TEST_NAME)
-add_executable(${TEST_NAME}-test tests/${TEST_NAME}/main.cpp ${BINDINGS_SRC_DIR}/${TEST_NAME}.cpp)
+set(TEST_SOURCES ${ARGN})
+if(NOT TEST_SOURCES)
+    set(TEST_SOURCES ${BINDINGS_SRC_DIR}/${TEST_NAME}.cpp)
+    list(APPEND BINDING_FILES ${TEST_SOURCES})
+endif()
+add_executable(${TEST_NAME}-test tests/${TEST_NAME}/main.cpp ${TEST_SOURCES})
 
 target_include_directories(${TEST_NAME}-test PRIVATE ${BINDINGS_SRC_DIR} include)
 target_link_directories(${TEST_NAME}-test PRIVATE ${BINDINGS_BUILD_DIR})
@@ -78,8 +83,6 @@ add_test(NAME ${TEST_NAME}-test COMMAND ${TEST_NAME}-test)
 memcheck_test(${TEST_NAME}-test)
 
 add_dependencies(${TEST_NAME}-test bindings)
-
-list(APPEND BINDING_FILES ${BINDINGS_SRC_DIR}/${TEST_NAME}.cpp)
 
 endmacro(test_case)
 
@@ -102,6 +105,9 @@ test_case(empty_type)
 test_case(error_types_builtin)
 test_case(reserved_field_name)
 test_case(type_flattening)
+list(APPEND BINDING_FILES ${BINDINGS_SRC_DIR}/async_calls.cpp)
+test_case(async_executor tests/async_executor/ffi_lifecycle.cpp)
+test_case(async_pending_at_exit ${BINDINGS_SRC_DIR}/async_calls.cpp)
 
 add_executable(ext_types_import-test
     tests/ext_types_import/main.cpp
@@ -142,3 +148,10 @@ add_custom_target(bindings ALL
     WORKING_DIRECTORY ${BINDINGS_BUILD_DIR}
     COMMENT "Generating bindings"
 )
+
+set_tests_properties(async_executor-test PROPERTIES TIMEOUT 45)
+set_tests_properties(async_pending_at_exit-test PROPERTIES TIMEOUT 15)
+if(VALGRIND)
+    set_tests_properties(async_executor-test-test-memcheck PROPERTIES TIMEOUT 90)
+    set_tests_properties(async_pending_at_exit-test-test-memcheck PROPERTIES TIMEOUT 30)
+endif()

@@ -143,7 +143,7 @@ impl CppCodeOracle {
     }
 
     pub(crate) fn fn_name(&self, nm: &str) -> String {
-        nm.to_string().to_snake_case()
+        self.var_name(nm)
     }
 
     pub(crate) fn var_name(&self, nm: &str) -> String {
@@ -350,6 +350,7 @@ pub(crate) fn ffi_type_name(ffi_type: &FfiType) -> Result<String> {
         FfiType::VoidPointer => "void *".into(),
         FfiType::RustBuffer(_) => "RustBuffer".into(),
         FfiType::ForeignBytes => "ForeignBytes".into(),
+        FfiType::Callback(name) if name == "RustFutureContinuationCallback" => name.clone(),
         FfiType::Callback(_) => "void *".into(),
         FfiType::Struct(name) => ffi_struct_name(name)?,
         FfiType::RustCallStatus => "RustCallStatus*".into(),

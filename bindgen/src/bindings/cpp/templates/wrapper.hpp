@@ -12,9 +12,19 @@
 #include <optional>
 #include <stdexcept>
 #include <streambuf>
+#include <string>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
+
+{%- if ci.has_async_fns() %}
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <future>
+#include <thread>
+{%- endif %}
 
 {%- for include in self.includes() %}
 #include <{{ include }}>
@@ -34,6 +44,17 @@ namespace uniffi {
 {% include "rust_buf_stream.cpp" %}
 }
 #endif
+
+{%- if ci.has_async_fns() %}
+#ifndef UNIFFI_CPP_ASYNC_FUTURE_V1
+#define UNIFFI_CPP_ASYNC_FUTURE_V1
+namespace uniffi {
+inline namespace cpp_async_v1 {
+{% include "async.hpp" %}
+}
+}
+#endif
+{%- endif %}
 
 {%- import "macros.cpp" as macros %}
 {% call macros::docstring_value(ci.namespace_docstring(), 0) %}
@@ -99,6 +120,9 @@ typedef {{ type_name }} {{ name }};
 namespace uniffi {
 using ::uniffi::RustStream;
 using ::uniffi::RustStreamBuffer;
+{%- if ci.has_async_fns() %}
+using ::uniffi::Future;
+{%- endif %}
 {%- for converter in self.external_ffi_converters() %}
 using {{ converter }};
 {%- endfor %}
@@ -169,14 +193,7 @@ void rustbuffer_free(RustBuffer);
 } // namespace uniffi
 
 {%~ for func in ci.function_definitions() %}
-{%- if !func.is_async() %}
 {%- call macros::docstring(func, 0) %}
-{%- match func.return_type() %}
-{%- when Some with (return_type) %}
-{{ return_type|type_name(ci) }} {{ func.name()|fn_name }}({% call macros::param_list(func) %});
-{%- when None %}
-void {{ func.name()|fn_name }}({% call macros::param_list(func) %});
-{%- endmatch %}
-{%- endif %}
+{% call macros::callable_return_type(func) %} {{ func.name()|fn_name }}({% call macros::param_list(func) %});
 {%- endfor %}
 } // namespace {{ namespace }}

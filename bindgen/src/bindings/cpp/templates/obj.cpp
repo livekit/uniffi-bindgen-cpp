@@ -30,37 +30,44 @@ namespace uniffi {
 
 {% match obj.primary_constructor() -%}
 {%- when Some with (ctor) %}
-{%- if !ctor.is_async() %}
-{{ type_name }} {{ impl_class_name }}::init({% call macros::param_list(ctor) %}) {
+{% if ctor.is_async() %}uniffi::Future<{% endif %}{{ type_name }}{% if ctor.is_async() %}>{% endif %} {{ impl_class_name }}::init({% call macros::param_list(ctor) %}) {
+    {%- if ctor.is_async() %}
+    return {% call macros::rust_call_async(ctor, "") %};
+    {%- else %}
     return {{ type_name }}(
         new {{ impl_class_name }}({%- call macros::rust_call(ctor) -%})
     );
+    {%- endif %}
 }
-{%- endif %}
 {% else -%}
 {% endmatch -%}
 
 {% for ctor in obj.alternate_constructors() %}
-{%- if !ctor.is_async() %}
-{{ type_name }} {{ impl_class_name }}::{{ ctor.name() }}({% call macros::param_list(ctor) %}) {
+{% if ctor.is_async() %}uniffi::Future<{% endif %}{{ type_name }}{% if ctor.is_async() %}>{% endif %} {{ impl_class_name }}::{{ ctor.name() }}({% call macros::param_list(ctor) %}) {
+    {%- if ctor.is_async() %}
+    return {% call macros::rust_call_async(ctor, "") %};
+    {%- else %}
     return {{ type_name }}(new {{ impl_class_name }}({% call macros::rust_call(ctor) %}));
+    {%- endif %}
 }
-{%- endif %}
 {% endfor %}
 
 {%- for method in obj.methods() %}
-{%- if !method.is_async() %}
-{% match method.return_type() %}{% when Some with (return_type) %}{{ return_type|type_name(ci) }} {% else %}void {% endmatch -%}
-{{ impl_class_name }}::{{ method.name()|fn_name }}({% call macros::param_list(method) %}) {
-    auto ptr = this->_uniffi_internal_clone_pointer();
-    {%- match method.return_type() %}
-    {% when Some with (return_type) %}
-    return uniffi::{{ return_type|lift_fn }}({% call macros::rust_call_with_prefix("ptr", method) %});
+{%- let clone_receiver = "this->_uniffi_internal_clone_pointer()" %}
+{% call macros::callable_return_type(method) %} {{ impl_class_name }}::{{ method.name()|fn_name }}({% call macros::param_list(method) %}) {
+    {# The async start callback clones the receiver only after the executor admission check. #}
+    {%- if method.is_async() %}
+    return {% call macros::rust_call_async(method, clone_receiver) %};
     {%- else %}
+    auto ptr = {{ clone_receiver }};
+    {%- match method.return_type() %}
+    {%- when Some with (return_type) %}
+    return uniffi::{{ return_type|lift_fn }}({% call macros::rust_call_with_prefix("ptr", method) %});
+    {%- when None %}
     {% call macros::rust_call_with_prefix("ptr", method) -%};
     {%- endmatch %}
+    {%- endif %}
 }
-{%- endif %}
 {%- endfor %}
 
 {{ impl_class_name }}::~{{ impl_class_name }}() {
