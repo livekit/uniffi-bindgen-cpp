@@ -279,12 +279,12 @@ method or when conversion to the declared error type fails. [Result handling][ru
 [rust-foreign-return]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi_converter_traits.rs#L357-L395
 [rust-foreign-result]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi_converter_impls.rs#L516-L540
 [rust-callback-conversion]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/callbackinterface.rs#L150-L210
-[executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L20-L190
+[executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L20-L205
 [drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L236-L322
-[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L442-L573
-[cancel-handle]: ../bindgen/src/bindings/cpp/templates/async.hpp#L420-L438
-[completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L330-L415
-[wait-guard]: ../bindgen/src/bindings/cpp/templates/async.hpp#L204-L208
+[future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L457-L588
+[cancel-handle]: ../bindgen/src/bindings/cpp/templates/async.hpp#L435-L453
+[completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L345-L430
+[wait-guard]: ../bindgen/src/bindings/cpp/templates/async.hpp#L219-L223
 [function]: ../bindgen/src/bindings/cpp/templates/fn_def.cpp#L1-L14
 [object]: ../bindgen/src/bindings/cpp/templates/obj.cpp#L32-L72
 [value-methods]: ../bindgen/src/bindings/cpp/templates/value_methods.cpp#L1-L14
@@ -307,4 +307,4 @@ method or when conversion to the declared error type fails. [Result handling][ru
 [foreign-drop]: ../bindgen/src/bindings/cpp/templates/async.cpp#L70-L113
 [shutdown]: ../bindgen/src/bindings/cpp/templates/async.hpp#L105-L136
 [restart]: ../bindgen/src/bindings/cpp/templates/async.hpp#L89-L101
-[registration]: ../bindgen/src/bindings/cpp/templates/async.hpp#L320-L328
+[registration]: ../bindgen/src/bindings/cpp/templates/async.hpp#L335-L343

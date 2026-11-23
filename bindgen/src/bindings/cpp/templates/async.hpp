@@ -165,20 +165,35 @@ class AsyncExecutor {
         }
     }
 
+    // Protects the queue, active operations, and worker flags.
     mutable std::mutex mutex_;
+    // Serializes start and shutdown through the worker join.
     std::mutex shutdown_mutex_;
+    // Wakes the worker when a task is queued or shutdown signals it to exit.
     std::condition_variable ready_;
+    // Wakes shutdown to recheck its first-poll and drain conditions.
     std::condition_variable drained_;
+    // Holds tasks in the order the worker will run them.
     std::deque<AsyncTask> tasks_;
+    // Maps active operation IDs to shutdown cancellation actions in registration order.
     std::map<uint64_t, AsyncTask> active_;
+    // Supplies increasing operation IDs across restarts.
     uint64_t next_id_ = 0;
+    // Lets callers check admission with an atomic read.
     std::atomic<bool> accepting_{true};
+    // Closes the task queue and tells the worker to exit.
     bool stopped_ = false;
+    // Keeps shutdown waiting while a worker task runs and releases its captures.
     bool running_ = false;
+    // Defers new first polls to the worker while shutdown waits for caller-thread polls.
     std::atomic<bool> closing_{false};
+    // Counts first polls assigned to callers by track() until run_inline() finishes them.
     std::atomic<unsigned> inline_polls_{0};
+    // Identifies the executor that owns the current worker thread.
     inline static thread_local const AsyncExecutor *current_worker_ = nullptr;
+    // Identifies the executor running an inline first poll for reentrancy checks.
     inline static thread_local const AsyncExecutor *current_inline_ = nullptr;
+    // Runs queued work and is joined by shutdown().
     std::thread worker_;
 };
 
