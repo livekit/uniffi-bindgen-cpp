@@ -33,13 +33,21 @@ class AsyncExecutor {
         return true;
     }
 
-    uint64_t track(AsyncTask cancel) {
+    // Registers a call. With poll_on_caller, also reports whether its first poll may run on the
+    // calling thread; a true answer must be followed by run_inline().
+    uint64_t track(AsyncTask cancel, bool *poll_on_caller = nullptr) {
         std::lock_guard<std::mutex> guard(mutex_);
         if (!accepting_.load(std::memory_order_relaxed)) {
             return 0;
         }
         const auto id = ++next_id_;
         active_.emplace(id, std::move(cancel));
+        if (poll_on_caller) {
+            *poll_on_caller = !closing_.load();
+            if (*poll_on_caller) {
+                ++inline_polls_;
+            }
+        }
         return id;
     }
 
@@ -60,6 +68,11 @@ class AsyncExecutor {
         current_inline_ = this;
         call();
         current_inline_ = previous;
+        // Sequentially consistent with shutdown(): it sees zero polls, or this sees closing_.
+        if (--inline_polls_ == 0 && closing_.load()) {
+            std::lock_guard<std::mutex> guard(mutex_);
+            drained_.notify_all();
+        }
     }
 
     void start() {
@@ -83,10 +96,15 @@ class AsyncExecutor {
         std::lock_guard<std::mutex> shutdown_guard(shutdown_mutex_);
         std::vector<AsyncTask> cancellations;
         {
-            std::lock_guard<std::mutex> guard(mutex_);
+            std::unique_lock<std::mutex> lock(mutex_);
             if (stopped_) {
                 return;
             }
+            // Let caller-thread polls finish while callbacks can still start, so none of them
+            // consumes a callback result that shutdown rejected.
+            closing_.store(true);
+            drained_.wait(lock, [this] { return inline_polls_.load() == 0; });
+            closing_.store(false);
             accepting_.store(false, std::memory_order_release);
             for (const auto &entry : active_) {
                 cancellations.push_back(entry.second);
@@ -144,6 +162,8 @@ class AsyncExecutor {
     std::atomic<bool> accepting_{true};
     bool stopped_ = false;
     bool running_ = false;
+    std::atomic<bool> closing_{false};
+    std::atomic<unsigned> inline_polls_{0};
     inline static thread_local const AsyncExecutor *current_worker_ = nullptr;
     inline static thread_local const AsyncExecutor *current_inline_ = nullptr;
     std::thread worker_;

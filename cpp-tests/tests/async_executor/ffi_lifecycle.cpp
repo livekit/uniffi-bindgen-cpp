@@ -412,7 +412,20 @@ void test_shutdown_cancels_before_repoll() {
     uniffi::start_async_executor();
 }
 
-// Shutdown waits for an in-flight caller-thread poll before cancelling and freeing the handle.
+class ImmediateParser final : public async_calls::TestParserForeign {
+  public:
+    uniffi::ForeignFuture<std::string> stringify(std::int32_t) override { return {}; }
+    uniffi::ForeignFuture<std::int32_t> parse(const std::string &) override { return {}; }
+    uniffi::ForeignFuture<void> wait() override {
+        return uniffi::ForeignFuture<void>([](auto success, auto) {
+            success();
+            return nullptr;
+        });
+    }
+};
+
+// Shutdown waits for an in-flight caller-thread poll before it closes admission, so a callback
+// that starts during that poll is not rejected. It then cancels the call and frees the handle.
 void test_shutdown_during_first_poll() {
     auto &executor = uniffi::detail::async_executor();
     PausedTask first_poll;
@@ -420,18 +433,29 @@ void test_shutdown_during_first_poll() {
     auto call = std::async(std::launch::async, [&] { return probe.start(); });
     first_poll.wait_until_paused();
 
-    std::promise<void> cancelling;
-    auto cancellation_requested = cancelling.get_future();
-    const std::uint64_t observer = executor.track([&] {
-        executor.untrack(observer);
-        cancelling.set_value();
-    });
-    ASSERT_NE(observer, 0u);
-
     auto stopping = std::async(std::launch::async, [] { uniffi::shutdown_async_executor(); });
-    wait_for_future(cancellation_requested);
-    ASSERT_FALSE(executor.accepting());
+    // A shutdown that does not wait closes admission within this window.
+    for (int i = 0; i < 100 && executor.accepting(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(executor.accepting());
     ASSERT_EQ(stopping.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+
+    const std::int8_t call_succeeded = 0;
+    std::promise<std::int8_t> completed;
+    auto completion = completed.get_future();
+    auto complete = +[](std::uint64_t data, UniffiForeignFutureResultVoid result) {
+        reinterpret_cast<std::promise<std::int8_t> *>(data)->set_value(result.call_status.code);
+    };
+    using Trampoline = async_calls::uniffi::UniffiCallbackInterfaceTestParser;
+    const auto handle =
+        async_calls::uniffi::FfiConverterTestParser::lower(std::make_shared<ImmediateParser>());
+    UniffiForeignFutureDroppedCallbackStruct drop{};
+    Trampoline::wait(handle, reinterpret_cast<void *>(complete),
+                     reinterpret_cast<std::uint64_t>(&completed), drop);
+    ASSERT_EQ(wait_for_future(completion), call_succeeded);
+    ASSERT_NE(drop.free, nullptr);
+    reinterpret_cast<void (*)(std::uint64_t)>(drop.free)(drop.handle);
     probe.expect_steps({Step::Start, Step::Poll});
 
     first_poll.resume();
@@ -439,6 +463,7 @@ void test_shutdown_during_first_poll() {
     EXPECT_EXCEPTION(wait_for_future(future), uniffi::AsyncCancelledError);
     wait_for_future(stopping);
     probe.expect_steps({Step::Start, Step::Poll, Step::Cancel, Step::Complete, Step::Free});
+    Trampoline::uniffi_free(handle);
     uniffi::start_async_executor();
 }
 

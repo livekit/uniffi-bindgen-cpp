@@ -145,15 +145,14 @@ class RustFutureState : public std::enable_shared_from_this<RustFutureState> {
     bool start() {
         const auto self = this->shared_from_this();
         auto &executor = ::uniffi::detail::async_executor();
-        bool poll_on_caller;
+        bool poll_on_caller = false;
         {
             std::lock_guard<std::mutex> guard(mutex_);
-            operation_id_ = executor.track([self] { self->cancel(); });
+            operation_id_ = executor.track([self] { self->cancel(); }, &poll_on_caller);
             if (!operation_id_) {
                 return false;
             }
             // Track the call before polling, and keep ownership if Rust wakes inline.
-            poll_on_caller = executor.accepting();
             driving_ = poll_on_caller;
             poll_requested_ = !poll_on_caller;
             poll_outstanding_ = poll_on_caller;
