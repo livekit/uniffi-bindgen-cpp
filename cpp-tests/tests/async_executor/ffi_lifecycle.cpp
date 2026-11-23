@@ -228,6 +228,56 @@ class RejectedParser final : public futures::AsyncParserForeign {
     }
 };
 
+class PausedTask {
+  public:
+    void pause() {
+        paused_.set_value();
+        wait_for_future(resume_signal_);
+    }
+
+    void wait_until_paused() { wait_for_future(paused_signal_); }
+    void resume() { resumed_.set_value(); }
+
+  private:
+    std::promise<void> paused_;
+    std::future<void> paused_signal_ = paused_.get_future();
+    std::promise<void> resumed_;
+    std::future<void> resume_signal_ = resumed_.get_future();
+};
+
+// Shutdown cancels a pending Rust call before it can consume a rejected C++ callback result.
+void test_shutdown_cancels_before_repoll() {
+    auto &executor = uniffi::detail::async_executor();
+    PausedTask before_callback_start;
+    PausedTask before_call_cancellation;
+
+    // Register first to pause shutdown after it closes admission and before it cancels the call.
+    const auto blocker = executor.track([&] { before_call_cancellation.pause(); });
+    ASSERT_NE(blocker, 0u);
+
+    std::promise<uniffi::Future<void>> call;
+    auto handoff = call.get_future();
+    ASSERT_TRUE(executor.enqueue([&] {
+        auto future = futures::wait_using_parser(std::make_shared<RejectedParser>());
+        // The first poll queues the callback startup behind this pause.
+        ASSERT_TRUE(executor.enqueue([&] { before_callback_start.pause(); }));
+        call.set_value(std::move(future));
+    }));
+    auto future = wait_for_future(handoff);
+    before_callback_start.wait_until_paused();
+
+    auto stopping = std::async(std::launch::async, [] { uniffi::shutdown_async_executor(); });
+    before_call_cancellation.wait_until_paused();
+    ASSERT_FALSE(executor.accepting());
+    before_callback_start.resume();
+    EXPECT_EXCEPTION(wait_for_future(future), uniffi::AsyncCancelledError);
+
+    executor.untrack(blocker);
+    before_call_cancellation.resume();
+    wait_for_future(stopping);
+    uniffi::start_async_executor();
+}
+
 } // namespace
 
 void test_rust_future_lifecycle() {
@@ -237,6 +287,7 @@ void test_rust_future_lifecycle() {
     test_cancellation_lifecycle();
     test_result_publication_move_failure();
     test_continuation_move_failure();
+    test_shutdown_cancels_before_repoll();
 }
 
 // Close admission after the start check while the caller still owns the new Rust handle.

@@ -233,11 +233,14 @@ class RustFutureState : public std::enable_shared_from_this<
             terminal_ = true;
             return Action::CompleteFuture;
         }
-        if (cancel_requested_ && !cancel_sent_) {
+        const bool can_poll = poll_requested_ && !poll_outstanding_;
+        // Shutdown closes admission before it runs the registered cancellations.
+        if (!cancel_sent_ &&
+            (cancel_requested_ || (can_poll && !::uniffi::detail::begin_async_call()))) {
             cancel_sent_ = true;
             return Action::CancelFuture;
         }
-        if (poll_requested_ && !poll_outstanding_) {
+        if (can_poll) {
             poll_requested_ = false;
             poll_outstanding_ = true;
             return Action::PollFuture;

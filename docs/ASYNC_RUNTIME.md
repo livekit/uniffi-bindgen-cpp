@@ -194,6 +194,11 @@ and joins the worker. Continuation delivery retains its own registration until i
 released. Keep control callbacks short so other calls and shutdown can make progress.
 [Drain and join][shutdown] · [Continuation registration][registration]
 
+Once admission closes, the driver sends cancellation before polling a pending Rust future.
+This covers a C++ callback that reports shutdown before the executor reaches the outer Rust
+call's registered cancellation. The driver still completes a future that has already signaled
+`READY`. [Action selection][next-action]
+
 New C++ calls to async Rust exports receive `AsyncExecutorError` until an application thread calls
 `start_async_executor()`. Start waits for any concurrent shutdown to finish joining the worker,
 then opens admission. Calling start on a running executor is harmless. Operation IDs continue
@@ -216,7 +221,7 @@ the generated bindings or the Rust library. [Singleton lifetime][executor]
 [rust-complete]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/rustfuture/future.rs#L162-L179
 [rust-foreign]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/foreignfuture.rs#L67-L99
 [executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L15-L150
-[drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L210-L293
+[drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L210-L296
 [future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L429-L547
 [cancel-handle]: ../bindgen/src/bindings/cpp/templates/async.hpp#L410-L427
 [completion]: ../bindgen/src/bindings/cpp/templates/async.hpp#L301-L389
@@ -229,13 +234,13 @@ the generated bindings or the Rust library. [Singleton lifetime][executor]
 [init]: ../bindgen/src/bindings/cpp/templates/wrapper.cpp#L13-L37
 [handle-guard]: ../bindgen/src/bindings/cpp/templates/async.cpp#L115-L134
 [state-start]: ../bindgen/src/bindings/cpp/templates/async.cpp#L149-L188
-[poll]: ../bindgen/src/bindings/cpp/templates/async.cpp#L295-L299
+[poll]: ../bindgen/src/bindings/cpp/templates/async.cpp#L298-L302
 [continuation]: ../bindgen/src/bindings/cpp/templates/async.cpp#L184-L208
-[next-action]: ../bindgen/src/bindings/cpp/templates/async.cpp#L227-L246
-[finish]: ../bindgen/src/bindings/cpp/templates/async.cpp#L311-L341
+[next-action]: ../bindgen/src/bindings/cpp/templates/async.cpp#L227-L249
+[finish]: ../bindgen/src/bindings/cpp/templates/async.cpp#L314-L344
 [status]: ../bindgen/src/bindings/cpp/templates/wrapper.cpp#L40-L64
-[call-async]: ../bindgen/src/bindings/cpp/templates/async.cpp#L364-L399
-[cancel]: ../bindgen/src/bindings/cpp/templates/async.cpp#L301-L309
+[call-async]: ../bindgen/src/bindings/cpp/templates/async.cpp#L367-L402
+[cancel]: ../bindgen/src/bindings/cpp/templates/async.cpp#L304-L312
 [callback-api]: ../bindgen/src/bindings/cpp/templates/callback.hpp#L6-L35
 [callback-entry]: ../bindgen/src/bindings/cpp/templates/callback_iface_tmpl.cpp#L7-L22
 [callback-results]: ../bindgen/src/bindings/cpp/templates/callback_iface_tmpl.cpp#L24-L140
