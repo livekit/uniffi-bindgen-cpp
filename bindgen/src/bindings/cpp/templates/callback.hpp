@@ -3,13 +3,13 @@
 {%- let trait_impl = canonical_type_name|callback_interface_name %}
 
 {% call macros::docstring_value(interface_docstring, 0) %}
-struct {{ interface_name }} {
+struct {{ interface_name }}{% if !interface_base_name.is_empty() %} : public {{ interface_base_name }}{% endif %} {
     virtual ~{{ interface_name }}() {}
 
     {%- for method in methods.iter() %}
     {%- call macros::docstring(method, 4) %}
     virtual
-    {% match method.return_type() %}{% when Some with (return_type) %}{{ return_type|type_name(ci) }} {% else %}void {% endmatch %}
+    {% if method.is_async() %}::uniffi::ForeignFuture<{% endif %}{% match method.return_type() %}{% when Some with (return_type) %}{{ return_type|type_name(ci) }}{% else %}void{% endmatch %}{% if method.is_async() %}>{% endif %}{{ " " }}
     {{- method.name()|fn_name }}({% call macros::param_list(method) %}) = 0;
     {%- endfor %}
 };
@@ -17,7 +17,7 @@ struct {{ interface_name }} {
 namespace uniffi {
     struct {{ trait_impl }} {
         {%- for (ffi_callback, method) in vtable_methods.iter() %}
-        static {% call macros::ffi_return_type(ffi_callback) %} {{ method.name()|var_name }}({% call macros::arg_list_ffi_decl_xx(ffi_callback) %});
+        static {% call macros::ffi_return_type(ffi_callback) %} {{ method.name()|var_name }}({% call macros::arg_list_ffi_decl_xx(ffi_callback) %}) noexcept;
         {%- endfor %}
 
         static void uniffi_free(uint64_t uniffi_handle);

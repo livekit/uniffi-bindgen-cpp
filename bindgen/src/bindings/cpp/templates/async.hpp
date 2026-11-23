@@ -222,6 +222,14 @@ inline void check_blocking_wait(bool ready) {
     }
 }
 
+template <typename T> struct ForeignFutureSuccess {
+    using Type = std::function<void(T)>;
+};
+
+template <> struct ForeignFutureSuccess<void> {
+    using Type = std::function<void()>;
+};
+
 } // namespace detail
 
 // Joins the shared worker after waiting for first polls, cancelling calls, and draining cleanup.
@@ -232,6 +240,36 @@ inline void shutdown_async_executor() { detail::async_executor().shutdown(); }
 // Start the shared worker or reopen admission after shutdown.
 // Calls from the worker or inside a caller-thread first poll return immediately.
 inline void start_async_executor() { detail::async_executor().start(); }
+
+// A deferred C++ callback result that Rust can await. The bridge calls start() on the worker.
+// The supplied success and failure callbacks may be called from any thread.
+template <typename T> class ForeignFuture {
+  public:
+    using Cancel = std::function<void()>;
+    using Success = typename detail::ForeignFutureSuccess<T>::Type;
+    using Failure = std::function<void(std::exception_ptr)>;
+    using Start = std::function<Cancel(Success, Failure)>;
+
+    ForeignFuture() = default;
+    explicit ForeignFuture(Start start) : start_(std::move(start)) {}
+
+    ForeignFuture(const ForeignFuture &) = delete;
+    ForeignFuture &operator=(const ForeignFuture &) = delete;
+    ForeignFuture(ForeignFuture &&) noexcept = default;
+    ForeignFuture &operator=(ForeignFuture &&) noexcept = default;
+
+    // Invoke the stored start function once and return its optional cancellation action.
+    Cancel start(Success success, Failure failure) && {
+        if (!start_) {
+            throw std::logic_error("UniFFI foreign future is invalid or has already been started");
+        }
+        auto start = std::move(start_);
+        return start(std::move(success), std::move(failure));
+    }
+
+  private:
+    Start start_;
+};
 
 // Carries the lifted value or exception delivered when an async call completes.
 template <typename T> class FutureResult {

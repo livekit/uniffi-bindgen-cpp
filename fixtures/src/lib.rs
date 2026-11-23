@@ -1,5 +1,6 @@
 mod uniffi_fixtures {
     arithmetical::uniffi_reexport_scaffolding!();
+    uniffi_async_api_client::uniffi_reexport_scaffolding!();
     uniffi_callbacks::uniffi_reexport_scaffolding!();
     custom_types::uniffi_reexport_scaffolding!();
     uniffi_geometry::uniffi_reexport_scaffolding!();
@@ -12,6 +13,7 @@ mod uniffi_fixtures {
     uniffi_coverall::uniffi_reexport_scaffolding!();
     uniffi_fixture_docstring::uniffi_reexport_scaffolding!();
     uniffi_fixture_callbacks::uniffi_reexport_scaffolding!();
+    uniffi_futures::uniffi_reexport_scaffolding!();
     uniffi_cpp_error_types_builtin::uniffi_reexport_scaffolding!();
 
     uniffi_cpp_custom_types_builtin::uniffi_reexport_scaffolding!();
