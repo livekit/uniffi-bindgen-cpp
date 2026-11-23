@@ -215,8 +215,9 @@ the generated bindings or the Rust library. [Singleton lifetime][executor]
 ### Rust-owned tasks during shutdown
 
 A task driven by a Rust runtime can still be awaiting a C++ callback when shutdown cancels it or
-rejects its startup. The bridge completes the callback with status code 3 and an empty error
-buffer. UniFFI lifts that status through the same branch as code 2, creating an
+rejects its startup. A callback that Rust invokes while the executor is stopped is rejected the
+same way. The bridge completes the callback with status code 3 and an empty error buffer.
+UniFFI lifts that status through the same branch as code 2, creating an
 `UnexpectedUniFFICallbackError`. [Callback cancellation status][callback-entry] ·
 [UniFFI status handling][rust-foreign-return]
 
@@ -236,7 +237,7 @@ method or when conversion to the declared error type fails. [Result handling][ru
 [rust-foreign]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/foreignfuture.rs#L67-L99
 [rust-foreign-return]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi_converter_traits.rs#L357-L395
 [rust-foreign-result]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi_converter_impls.rs#L516-L540
-[rust-callback-conversion]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/callbackinterface.rs#L150-L193
+[rust-callback-conversion]: https://github.com/mozilla/uniffi-rs/blob/05b45b110f652d58d94c653992aeb3adc3a094f4/uniffi_core/src/ffi/callbackinterface.rs#L150-L210
 [executor]: ../bindgen/src/bindings/cpp/templates/async.hpp#L15-L150
 [drive]: ../bindgen/src/bindings/cpp/templates/async.cpp#L210-L296
 [future]: ../bindgen/src/bindings/cpp/templates/async.hpp#L429-L547
