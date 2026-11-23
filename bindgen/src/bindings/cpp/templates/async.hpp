@@ -1,3 +1,15 @@
+// Reported when UniFFI completes a cancelled Rust future.
+class AsyncCancelledError : public std::runtime_error {
+  public:
+    AsyncCancelledError() : std::runtime_error("UniFFI async call cancelled") {}
+};
+
+// Reported when the executor rejects a new Rust call or continuation.
+class AsyncExecutorError : public std::runtime_error {
+  public:
+    AsyncExecutorError() : std::runtime_error("UniFFI async executor rejected a task") {}
+};
+
 // Used for queued tasks and registered cancellation actions.
 using AsyncTask = std::function<void()>;
 
@@ -203,6 +215,13 @@ inline bool enqueue_async(AsyncTask task) noexcept {
 
 inline bool begin_async_call() { return async_executor().accepting(); }
 
+// Reject a wait that would block the executor's worker.
+inline void check_blocking_wait(bool ready) {
+    if (!ready && async_executor().is_worker()) {
+        throw std::logic_error("Cannot block the UniFFI executor; use Future::then instead");
+    }
+}
+
 } // namespace detail
 
 // Joins the shared worker after waiting for first polls, cancelling calls, and draining cleanup.
@@ -213,3 +232,319 @@ inline void shutdown_async_executor() { detail::async_executor().shutdown(); }
 // Start the shared worker or reopen admission after shutdown.
 // Calls from the worker or inside a caller-thread first poll return immediately.
 inline void start_async_executor() { detail::async_executor().start(); }
+
+// Carries the lifted value or exception delivered when an async call completes.
+template <typename T> class FutureResult {
+  public:
+    explicit FutureResult(T value) : value_(std::move(value)) {}
+    explicit FutureResult(std::exception_ptr error) noexcept : error_(std::move(error)) {}
+
+    FutureResult(const FutureResult &) = default;
+    FutureResult &operator=(const FutureResult &) = default;
+    FutureResult &operator=(FutureResult &&) = default;
+
+    FutureResult(FutureResult &&other) noexcept : error_(std::move(other.error_)) {
+        if (other.value_) {
+            try {
+                value_.emplace(std::move(*other.value_));
+            } catch (...) {
+                // Deliver a failed value transfer through the future's normal error path.
+                error_ = std::current_exception();
+            }
+        }
+    }
+
+    bool has_value() const noexcept { return !error_; }
+    std::exception_ptr error() const noexcept { return error_; }
+
+    // Move out the value or rethrow the stored exception.
+    T get() && {
+        if (error_) {
+            std::rethrow_exception(error_);
+        }
+        return std::move(*value_);
+    }
+
+  private:
+    std::optional<T> value_;
+    std::exception_ptr error_;
+};
+
+// Carries completion or an exception for a void result.
+template <> class FutureResult<void> {
+  public:
+    FutureResult() = default;
+    explicit FutureResult(std::exception_ptr error) noexcept : error_(std::move(error)) {}
+
+    bool has_value() const noexcept { return !error_; }
+    std::exception_ptr error() const noexcept { return error_; }
+
+    // Observe completion, rethrowing a stored exception.
+    void get() const {
+        if (error_) {
+            std::rethrow_exception(error_);
+        }
+    }
+
+  private:
+    std::exception_ptr error_;
+};
+
+namespace detail {
+
+// Retains the executor through delivery, including when then() is attached to an already-ready
+// call.
+struct ContinuationRegistration {
+    ContinuationRegistration() : id(async_executor().track([] {})) {
+        if (!id) {
+            throw AsyncExecutorError();
+        }
+    }
+    ~ContinuationRegistration() { async_executor().untrack(id); }
+    uint64_t id;
+};
+
+template <typename T> class FutureCompletionState {
+  public:
+    using Result = FutureResult<T>;
+    using Callback = std::function<void(Result)>;
+
+    void complete(Result result) noexcept {
+        Callback callback;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (result_) {
+                return;
+            }
+            result_.emplace(std::move(result));
+            callback = std::move(callback_);
+        }
+        ready_.notify_all();
+        if (callback) {
+            enqueue_continuation(std::move(callback));
+        }
+    }
+
+    T get() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        check_blocking_wait(result_.has_value());
+        ready_.wait(lock, [this] { return result_.has_value(); });
+        auto result = std::move(*result_);
+        lock.unlock();
+        return std::move(result).get();
+    }
+
+    void wait() const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        check_blocking_wait(result_.has_value());
+        ready_.wait(lock, [this] { return result_.has_value(); });
+    }
+
+    template <typename Rep, typename Period>
+    std::future_status wait_for(const std::chrono::duration<Rep, Period> &timeout) const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        check_blocking_wait(result_.has_value() || timeout <= timeout.zero());
+        return ready_.wait_for(lock, timeout, [this] { return result_.has_value(); })
+                   ? std::future_status::ready
+                   : std::future_status::timeout;
+    }
+
+    void then(Callback callback) {
+        auto registration = std::make_shared<ContinuationRegistration>();
+        callback = [registration, callback = std::move(callback)](Result result) mutable {
+            callback(std::move(result));
+        };
+        bool ready;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            ready = result_.has_value();
+            if (!ready) {
+                callback_ = std::move(callback);
+                return;
+            }
+        }
+        enqueue_continuation(std::move(callback));
+    }
+
+  private:
+    void enqueue_continuation(Callback callback) noexcept {
+        Result result = [&] {
+            std::lock_guard<std::mutex> guard(mutex_);
+            return std::move(*result_);
+        }();
+        auto delivery =
+            std::make_shared<std::pair<Callback, Result>>(std::move(callback), std::move(result));
+        if (!enqueue_async([delivery]() mutable {
+                try {
+                    delivery->first(std::move(delivery->second));
+                } catch (...) {
+                    // User exceptions do not escape the executor thread.
+                }
+            })) {
+            std::terminate();
+        }
+    }
+
+    mutable std::mutex mutex_;
+    mutable std::condition_variable ready_;
+    std::optional<Result> result_;
+    Callback callback_;
+};
+
+} // namespace detail
+
+// Copyable handle for requesting cancellation from any thread.
+class FutureCancelHandle {
+  public:
+    FutureCancelHandle() = default;
+
+    // Request cancellation if the call is still active.
+    void cancel() const noexcept {
+        if (cancel_) {
+            cancel_();
+        }
+    }
+
+  private:
+    template <typename T> friend class Future;
+
+    explicit FutureCancelHandle(std::function<void()> cancel) noexcept
+        : cancel_(std::move(cancel)) {}
+
+    std::function<void()> cancel_;
+};
+
+// Move-only token returned by Future::then(). Destroying it requests cancellation.
+// Use the token from one thread at a time.
+class FutureContinuation {
+  public:
+    FutureContinuation() = default;
+    explicit FutureContinuation(std::function<void()> cancel) : cancel_(std::move(cancel)) {}
+
+    FutureContinuation(const FutureContinuation &) = delete;
+    FutureContinuation &operator=(const FutureContinuation &) = delete;
+
+    FutureContinuation(FutureContinuation &&other) noexcept : cancel_(std::move(other.cancel_)) {
+        other.cancel_ = nullptr;
+    }
+
+    FutureContinuation &operator=(FutureContinuation &&other) noexcept {
+        if (this != &other) {
+            cancel();
+            cancel_ = std::move(other.cancel_);
+            other.cancel_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~FutureContinuation() { cancel(); }
+
+    // Give up cancellation ownership so the call can continue after the token is destroyed.
+    void detach() noexcept { cancel_ = nullptr; }
+
+    // Request cancellation. The worker still delivers the eventual result.
+    void cancel() noexcept {
+        if (cancel_) {
+            auto cancel = std::move(cancel_);
+            cancel_ = nullptr;
+            cancel();
+        }
+    }
+
+  private:
+    std::function<void()> cancel_;
+};
+
+// Move-only handle to an async Rust call. Destroying it while incomplete requests cancellation.
+// Use the future from one thread at a time and use cancel_handle() for cross-thread cancellation.
+// Blocking waits on the executor's worker throw std::logic_error.
+template <typename T> class Future {
+  public:
+    using Result = FutureResult<T>;
+    using Callback = std::function<void(Result)>;
+
+    Future() = default;
+    Future(std::shared_ptr<detail::FutureCompletionState<T>> state,
+           std::function<void()> cancel) noexcept
+        : state_(std::move(state)), cancel_(std::move(cancel)) {}
+
+    Future(const Future &) = delete;
+    Future &operator=(const Future &) = delete;
+
+    Future(Future &&other) noexcept
+        : state_(std::move(other.state_)), cancel_(std::move(other.cancel_)) {
+        other.cancel_ = nullptr;
+    }
+
+    Future &operator=(Future &&other) noexcept {
+        if (this != &other) {
+            cancel();
+            state_ = std::move(other.state_);
+            cancel_ = std::move(other.cancel_);
+            other.cancel_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~Future() { cancel(); }
+
+    bool valid() const noexcept { return state_ != nullptr; }
+
+    // Take an independent handle before consuming or moving this future.
+    [[nodiscard]] FutureCancelHandle cancel_handle() const { return FutureCancelHandle(cancel_); }
+
+    // Wait for completion and consume the result, rethrowing any stored error.
+    decltype(auto) get() {
+        require_state();
+        detail::check_blocking_wait(state_->wait_for(std::chrono::seconds(0)) ==
+                                    std::future_status::ready);
+        auto state = std::move(state_);
+        cancel_ = nullptr;
+        return state->get();
+    }
+
+    // Wait for readiness and keep the result available for get() or then().
+    void wait() const {
+        require_state();
+        state_->wait();
+    }
+
+    // Wait up to timeout. A nonpositive timeout checks readiness immediately.
+    template <typename Rep, typename Period>
+    std::future_status wait_for(const std::chrono::duration<Rep, Period> &timeout) const {
+        require_state();
+        return state_->wait_for(timeout);
+    }
+
+    // Consume this future and deliver its result on the worker. The returned token owns cancellation.
+    [[nodiscard]] FutureContinuation then(Callback callback) && {
+        require_state();
+        if (!callback) {
+            throw std::invalid_argument("UniFFI future continuation must not be empty");
+        }
+        state_->then(std::move(callback));
+        auto cancel = std::move(cancel_);
+        cancel_ = nullptr;
+        state_.reset();
+        return FutureContinuation(std::move(cancel));
+    }
+
+    // Request cancellation and keep the result available for get() or then().
+    void cancel() noexcept {
+        if (cancel_) {
+            auto cancel = std::move(cancel_);
+            cancel_ = nullptr;
+            cancel();
+        }
+    }
+
+  private:
+    void require_state() const {
+        if (!state_) {
+            throw std::future_error(std::future_errc::no_state);
+        }
+    }
+
+    std::shared_ptr<detail::FutureCompletionState<T>> state_;
+    std::function<void()> cancel_;
+};
