@@ -66,6 +66,50 @@
         uniffi::{{ self_type|lower_fn }}(other))
 {%- endmacro %}
 
+{% macro rust_call_async(func, prefix) -%}
+    uniffi::rust_call_async<{% match func.return_type() %}{% when Some with (value_type) %}{{ value_type|type_name(ci) }}{% when None %}void{% endmatch %}>(
+        [&]() {
+            return {{ func.ffi_func().name() }}(
+                {%- if !prefix.to_string().is_empty() -%}
+                {{ prefix }}{% if !func.arguments().is_empty() %}, {% endif %}
+                {%- endif -%}
+                {%- call arg_list_lowered(func) -%}
+            );
+        },
+        {{ func.ffi_rust_future_poll(ci) }},
+        {{ func.ffi_rust_future_cancel(ci) }},
+        {{ func.ffi_rust_future_complete(ci) }},
+        {{ func.ffi_rust_future_free(ci) }},
+{%- match func.return_type() %}
+{% when Some with (value_type) %}
+        [](auto value) { return uniffi::{{ value_type|lift_fn }}(value); },
+{% when None %}
+        nullptr,
+{%- endmatch %}
+{%- match func.throws_type() %}
+{% when Some with (e) %}
+        uniffi::{{ e|ffi_error_converter_name }}::lift
+{%- else %}
+        nullptr
+{%- endmatch %}
+    )
+{%- endmacro %}
+
+{% macro rust_call_async_with_value(func, self_type, receiver) -%}
+    {%- let converter = self_type|lower_fn -%}
+    {%- let prefix = "uniffi::" ~ converter ~ "(" ~ receiver ~ ")" -%}
+    {%- call rust_call_async(func, prefix) -%}
+{%- endmacro %}
+
+{% macro callable_return_type(method) -%}
+    {%- if method.is_async() %}::uniffi::Future<{% endif -%}
+    {%- match method.return_type() -%}
+    {%- when Some with (return_type) -%}{{ return_type|type_name(ci) }}
+    {%- when None -%}void
+    {%- endmatch -%}
+    {%- if method.is_async() %}>{% endif -%}
+{%- endmacro %}
+
 {% macro param_list(func) %}
 {%- for arg in func.arguments() -%}
 {{ arg|parameter(ci) }}

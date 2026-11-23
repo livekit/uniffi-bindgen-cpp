@@ -1,9 +1,6 @@
 {%- for method in methods %}
-{%- if !method.is_async() %}
 {%- call macros::docstring(method, 0) %}
-{% match method.return_type() %}{% when Some with (return_type) %}{{ return_type|type_name(ci) }} {% else %}void {% endmatch -%}
-{{ method.name()|fn_name }}({{ type_name }} _uniffi_self{% if !method.arguments().is_empty() %}, {% endif %}{% call macros::param_list(method) %});
-{%- endif %}
+{% call macros::callable_return_type(method) %} {{ method.name()|fn_name }}({{ type_name }} _uniffi_self{% if !method.arguments().is_empty() %}, {% endif %}{% call macros::param_list(method) %});
 {%- endfor %}
 
 {%- if uniffi_trait_methods.display_fmt.is_some() %}
