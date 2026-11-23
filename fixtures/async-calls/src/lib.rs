@@ -4,6 +4,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+use async_trait::async_trait;
 use futures_timer::Delay;
 use std::{
     sync::{
@@ -127,6 +128,88 @@ impl ValidationMode {
             Self::Reject => Err(MyError::Foo),
         }
     }
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum AsyncParserError {
+    #[error("invalid integer")]
+    InvalidInteger,
+    #[error("unexpected callback error")]
+    Unexpected,
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for AsyncParserError {
+    fn from(_: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Unexpected
+    }
+}
+
+#[uniffi::export(with_foreign)]
+#[async_trait::async_trait]
+pub trait TestParser: Send + Sync {
+    async fn stringify(&self, value: i32) -> String;
+    async fn parse(&self, value: String) -> Result<i32, AsyncParserError>;
+    async fn wait(&self);
+}
+
+#[uniffi::export]
+pub async fn stringify_using_parser(parser: Arc<dyn TestParser>, value: i32) -> String {
+    parser.stringify(value).await
+}
+
+#[uniffi::export]
+pub async fn parse_using_parser(
+    parser: Arc<dyn TestParser>,
+    value: String,
+) -> Result<i32, AsyncParserError> {
+    parser.parse(value).await
+}
+
+#[uniffi::export]
+pub async fn wait_using_parser(parser: Arc<dyn TestParser>) {
+    parser.wait().await
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn stringify_on_tokio(parser: Arc<dyn TestParser>, value: i32) -> String {
+    let parent = std::thread::current().id();
+    tokio::spawn(async move {
+        assert_ne!(std::thread::current().id(), parent);
+        parser.stringify(value).await
+    })
+    .await
+    .expect("async parser task failed")
+}
+
+struct RustAsyncParser;
+
+#[async_trait::async_trait]
+impl TestParser for RustAsyncParser {
+    async fn stringify(&self, value: i32) -> String {
+        value.to_string()
+    }
+
+    async fn parse(&self, value: String) -> Result<i32, AsyncParserError> {
+        value.parse().map_err(|_| AsyncParserError::InvalidInteger)
+    }
+
+    async fn wait(&self) {}
+}
+
+#[uniffi::export]
+pub fn rust_async_parser() -> Arc<dyn TestParser> {
+    Arc::new(RustAsyncParser)
+}
+
+#[uniffi::export(callback_interface)]
+#[async_trait::async_trait]
+pub trait AsyncGreeter: Send + Sync {
+    async fn greeting(&self) -> String;
+}
+
+#[uniffi::export]
+pub async fn greet_with(greeter: Box<dyn AsyncGreeter>) -> String {
+    greeter.greeting().await
 }
 
 uniffi::setup_scaffolding!("async_calls");

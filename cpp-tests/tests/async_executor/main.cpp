@@ -16,6 +16,33 @@ void wait_for_queued_work(AsyncExecutor &executor) {
     wait_for_future(barrier);
 }
 
+// Generated components share the singleton and deliver ready continuations on its worker.
+void test_singleton_across_components() {
+    auto &executor = async_executor();
+    ASSERT_EQ(&executor, &executor_from_peer());
+
+    auto worker_id = std::make_shared<std::promise<std::thread::id>>();
+    auto observed_worker = worker_id->get_future();
+    ASSERT_TRUE(executor_from_peer().enqueue([worker_id] {
+        ASSERT_TRUE(async_executor().is_worker());
+        worker_id->set_value(std::this_thread::get_id());
+    }));
+    const auto worker = wait_for_future(observed_worker);
+    ASSERT_NE(worker, std::this_thread::get_id());
+
+    // Exercise then() both after a result is ready and while a result is pending (below).
+    auto future = futures::always_ready();
+    ASSERT_EQ(future.wait_for(test_timeout), std::future_status::ready);
+    auto delivered = std::make_shared<std::promise<void>>();
+    auto result = delivered->get_future();
+    auto continuation = std::move(future).then([worker, delivered](auto completed) {
+        ASSERT_EQ(std::this_thread::get_id(), worker);
+        ASSERT_TRUE(std::move(completed).get());
+        delivered->set_value();
+    });
+    wait_for_future(result);
+}
+
 // Two Rust streams receive independently, with bounded buffering and clean end-of-stream.
 void test_interleaved_stream_reads() {
     const auto first = wait_for_future(async_calls::SampleStream::open());
@@ -215,12 +242,37 @@ void test_singleton_shutdown() {
     uniffi::shutdown_async_executor();
 }
 
+class RestartParser final : public async_calls::TestParserForeign {
+  public:
+    uniffi::ForeignFuture<std::string> stringify(std::int32_t value) override {
+        return uniffi::ForeignFuture<std::string>([value](auto success, auto) {
+            success(std::to_string(value));
+            return nullptr;
+        });
+    }
+    uniffi::ForeignFuture<std::int32_t> parse(const std::string &) override { return {}; }
+    uniffi::ForeignFuture<void> wait() override { return {}; }
+};
+
+// After explicit restart, the singleton can poll Rust and deliver an async C++ callback.
+void test_singleton_restart() {
+    uniffi::start_async_executor();
+    uniffi::start_async_executor();
+    ASSERT_TRUE(wait_for_future(futures::always_ready()));
+    ASSERT_EQ(wait_for_future(async_calls::stringify_using_parser(std::make_shared<RestartParser>(), 42)),
+              "42");
+    uniffi::shutdown_async_executor();
+    EXPECT_EXCEPTION(wait_for_future(futures::always_ready()), uniffi::AsyncExecutorError);
+}
+
 } // namespace
 } // namespace executor_tests
 
 int main() {
     using namespace executor_tests;
+    test_singleton_across_components();
     test_rust_future_lifecycle();
+    test_foreign_callback_lifecycle();
     test_pending_future();
     test_interleaved_stream_reads();
     test_cancel_pending_read();
@@ -230,4 +282,7 @@ int main() {
     test_detached_continuation();
     test_future_move_assignment();
     test_singleton_shutdown();
+    test_foreign_callback_after_shutdown();
+    test_foreign_states_across_restart();
+    test_singleton_restart();
 }

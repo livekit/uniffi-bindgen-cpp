@@ -1,6 +1,117 @@
 constexpr int8_t UNIFFI_RUST_FUTURE_POLL_READY = 0;
 constexpr int8_t UNIFFI_RUST_FUTURE_POLL_WAKE = 1;
 
+// Coordinates completion and Rust-driven cancellation for a C++ implementation of an async
+// callback-interface method.  Dropping the Rust future wins the completion race, invokes the
+// operation's cancel action, and sends a cancelled result exactly once.
+class ForeignFutureTaskState {
+  public:
+    void enqueue_or_cancel(::uniffi::AsyncTask task) noexcept {
+        if (!::uniffi::detail::enqueue_async(std::move(task))) {
+            cancel();
+        }
+    }
+
+    void start(const std::shared_ptr<ForeignFutureTaskState> &self) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto weak = std::weak_ptr<ForeignFutureTaskState>(self);
+        operation_id_ = ::uniffi::detail::async_executor().track([weak] {
+            if (auto state = weak.lock()) {
+                state->enqueue_or_cancel([state] { state->cancel(); });
+            }
+        });
+    }
+
+    bool can_start() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return operation_id_ != 0 && !finished_;
+    }
+
+    bool finish() noexcept {
+        std::function<void()> cancel;
+        std::function<void()> complete_cancelled;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (finished_) {
+                return false;
+            }
+            finished_ = true;
+            cancel = std::move(cancel_);
+            complete_cancelled = std::move(complete_cancelled_);
+        }
+        ::uniffi::detail::async_executor().untrack(operation_id_);
+        // Releasing captures can destroy application objects; do it outside the state mutex.
+        return true;
+    }
+
+    void set_cancel(std::function<void()> cancel) noexcept {
+        std::function<void()> cancel_now;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (cancel_requested_) {
+                cancel_now = std::move(cancel);
+            } else if (!finished_) {
+                cancel_ = std::move(cancel);
+            }
+        }
+        if (cancel_now) {
+            try {
+                cancel_now();
+            } catch (...) {
+            }
+        }
+    }
+
+    void set_cancel_completion(std::function<void()> complete_cancelled) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        complete_cancelled_ = std::move(complete_cancelled);
+    }
+
+    void cancel() noexcept {
+        std::function<void()> cancel;
+        std::function<void()> complete_cancelled;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (finished_) {
+                return;
+            }
+            finished_ = true;
+            cancel_requested_ = true;
+            cancel = std::move(cancel_);
+            complete_cancelled = std::move(complete_cancelled_);
+        }
+        if (cancel) {
+            try {
+                cancel();
+            } catch (...) {
+            }
+        }
+        if (complete_cancelled) {
+            complete_cancelled();
+        }
+        ::uniffi::detail::async_executor().untrack(operation_id_);
+    }
+
+  private:
+    std::mutex mutex_;
+    uint64_t operation_id_ = 0;
+    bool finished_ = false;
+    bool cancel_requested_ = false;
+    std::function<void()> cancel_;
+    std::function<void()> complete_cancelled_;
+};
+
+inline uint64_t foreign_future_handle(const std::shared_ptr<ForeignFutureTaskState> &state) {
+    return reinterpret_cast<uint64_t>(new std::shared_ptr<ForeignFutureTaskState>(state));
+}
+
+inline void foreign_future_drop(uint64_t handle) noexcept {
+    auto state = std::unique_ptr<std::shared_ptr<ForeignFutureTaskState>>(
+        reinterpret_cast<std::shared_ptr<ForeignFutureTaskState> *>(handle));
+    auto task_state = *state;
+    task_state->enqueue_or_cancel([task_state] { task_state->cancel(); });
+}
+
 using RustFutureHandleFn = void (*)(uint64_t);
 
 class RustFutureHandleGuard {

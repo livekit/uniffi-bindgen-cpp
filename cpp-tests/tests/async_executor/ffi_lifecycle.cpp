@@ -321,6 +321,149 @@ void test_continuation_move_failure() {
     probe.expect_steps({Step::Start, Step::Poll, Step::Complete, Step::Free});
 }
 
+class RejectedParser final : public async_calls::TestParserForeign {
+  public:
+    uniffi::ForeignFuture<std::string> stringify(std::int32_t) override { return {}; }
+    uniffi::ForeignFuture<std::int32_t> parse(const std::string &) override { return {}; }
+    uniffi::ForeignFuture<void> wait() override {
+        assert(false && "a rejected callback started");
+        return {};
+    }
+};
+
+class DeferredParser final : public async_calls::TestParserForeign {
+  public:
+    uniffi::ForeignFuture<std::string> stringify(std::int32_t) override { return {}; }
+    uniffi::ForeignFuture<std::int32_t> parse(const std::string &) override { return {}; }
+    uniffi::ForeignFuture<void> wait() override {
+        return uniffi::ForeignFuture<void>([this](auto success, auto) {
+            completing.set_value(std::move(success));
+            return [this] { ++cancellations; };
+        });
+    }
+
+    std::promise<uniffi::ForeignFuture<void>::Success> completing;
+    unsigned cancellations = 0;
+};
+
+// A success queued while Rust's drop is being processed cannot complete the callback a second time.
+void test_completion_after_foreign_drop() {
+    auto &executor = uniffi::detail::async_executor();
+    struct CompletionRecord {
+        unsigned calls = 0;
+        std::int8_t status = -1;
+    } record;
+    auto complete = +[](std::uint64_t data, UniffiForeignFutureResultVoid result) {
+        auto &received = *reinterpret_cast<CompletionRecord *>(data);
+        ++received.calls;
+        received.status = result.call_status.code;
+    };
+
+    auto parser = std::make_shared<DeferredParser>();
+    auto completing = parser->completing.get_future();
+    using Trampoline = async_calls::uniffi::UniffiCallbackInterfaceTestParser;
+    const auto handle = async_calls::uniffi::FfiConverterTestParser::lower(parser);
+    UniffiForeignFutureDroppedCallbackStruct drop{};
+    Trampoline::wait(handle, reinterpret_cast<void *>(complete),
+                     reinterpret_cast<std::uint64_t>(&record), drop);
+    auto success = wait_for_future(completing);
+
+    PausedTask worker;
+    ASSERT_TRUE(executor.enqueue([&] { worker.pause(); }));
+    worker.wait_until_paused();
+    ASSERT_NE(drop.free, nullptr);
+    reinterpret_cast<void (*)(std::uint64_t)>(drop.free)(drop.handle);
+    success();
+
+    std::promise<void> drained;
+    auto barrier = drained.get_future();
+    ASSERT_TRUE(executor.enqueue([&] { drained.set_value(); }));
+    worker.resume();
+    wait_for_future(barrier);
+    ASSERT_EQ(record.calls, 1u);
+    ASSERT_EQ(record.status, cancelled);
+    ASSERT_EQ(parser->cancellations, 1u);
+    Trampoline::uniffi_free(handle);
+}
+
+// Shutdown cancels a pending Rust call before it can consume a rejected C++ callback result.
+void test_shutdown_cancels_before_repoll() {
+    auto &executor = uniffi::detail::async_executor();
+    PausedTask before_callback_start;
+    PausedTask before_call_cancellation;
+
+    // Register first to pause shutdown after it closes admission and before it cancels the call.
+    const auto blocker = executor.track([&] { before_call_cancellation.pause(); });
+    ASSERT_NE(blocker, 0u);
+
+    ASSERT_TRUE(executor.enqueue([&] { before_callback_start.pause(); }));
+    before_callback_start.wait_until_paused();
+    auto future = async_calls::wait_using_parser(std::make_shared<RejectedParser>());
+
+    auto stopping = std::async(std::launch::async, [] { uniffi::shutdown_async_executor(); });
+    before_call_cancellation.wait_until_paused();
+    ASSERT_FALSE(executor.accepting());
+    before_callback_start.resume();
+    EXPECT_EXCEPTION(wait_for_future(future), uniffi::AsyncCancelledError);
+
+    executor.untrack(blocker);
+    before_call_cancellation.resume();
+    wait_for_future(stopping);
+    uniffi::start_async_executor();
+}
+
+class ImmediateParser final : public async_calls::TestParserForeign {
+  public:
+    uniffi::ForeignFuture<std::string> stringify(std::int32_t) override { return {}; }
+    uniffi::ForeignFuture<std::int32_t> parse(const std::string &) override { return {}; }
+    uniffi::ForeignFuture<void> wait() override {
+        return uniffi::ForeignFuture<void>([](auto success, auto) {
+            success();
+            return nullptr;
+        });
+    }
+};
+
+// Shutdown waits for an in-flight caller-thread poll before it closes admission, so a callback
+// that starts during that poll is not rejected. It then cancels the call and frees the handle.
+void test_shutdown_during_first_poll() {
+    auto &executor = uniffi::detail::async_executor();
+    PausedTask first_poll;
+    RustFutureProbe probe({PollReply::Park}, &first_poll);
+    auto call = std::async(std::launch::async, [&] { return probe.start(); });
+    first_poll.wait_until_paused();
+
+    auto stopping = std::async(std::launch::async, [] { uniffi::shutdown_async_executor(); });
+    wait_for_deferred_first_poll(executor);
+    ASSERT_TRUE(executor.accepting());
+    ASSERT_EQ(stopping.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+
+    const std::int8_t call_succeeded = 0;
+    std::promise<std::int8_t> completed;
+    auto completion = completed.get_future();
+    auto complete = +[](std::uint64_t data, UniffiForeignFutureResultVoid result) {
+        reinterpret_cast<std::promise<std::int8_t> *>(data)->set_value(result.call_status.code);
+    };
+    using Trampoline = async_calls::uniffi::UniffiCallbackInterfaceTestParser;
+    const auto handle =
+        async_calls::uniffi::FfiConverterTestParser::lower(std::make_shared<ImmediateParser>());
+    UniffiForeignFutureDroppedCallbackStruct drop{};
+    Trampoline::wait(handle, reinterpret_cast<void *>(complete),
+                     reinterpret_cast<std::uint64_t>(&completed), drop);
+    ASSERT_EQ(wait_for_future(completion), call_succeeded);
+    ASSERT_NE(drop.free, nullptr);
+    reinterpret_cast<void (*)(std::uint64_t)>(drop.free)(drop.handle);
+    probe.expect_steps({Step::Start, Step::Poll});
+
+    first_poll.resume();
+    auto future = wait_for_future(call);
+    EXPECT_EXCEPTION(wait_for_future(future), uniffi::AsyncCancelledError);
+    wait_for_future(stopping);
+    probe.expect_steps({Step::Start, Step::Poll, Step::Cancel, Step::Complete, Step::Free});
+    Trampoline::uniffi_free(handle);
+    uniffi::start_async_executor();
+}
+
 } // namespace
 
 void test_rust_future_lifecycle() {
@@ -333,6 +476,12 @@ void test_rust_future_lifecycle() {
     test_cancellation_lifecycle();
     test_result_publication_move_failure();
     test_continuation_move_failure();
+}
+
+void test_foreign_callback_lifecycle() {
+    test_completion_after_foreign_drop();
+    test_shutdown_cancels_before_repoll();
+    test_shutdown_during_first_poll();
 }
 
 // Close admission after the start check while the caller still owns the new Rust handle.
@@ -355,6 +504,47 @@ void test_shutdown_during_handle_creation() {
         [](int value) { return value; }, nullptr);
     EXPECT_EXCEPTION(wait_for_future(result), uniffi::AsyncExecutorError);
     ASSERT_EQ(frees, 1u);
+}
+
+// The trampoline must complete once even when it cannot start the application callback.
+void test_foreign_callback_after_shutdown() {
+    struct CompletionRecord {
+        unsigned calls = 0;
+        std::int8_t status = -1;
+    } record;
+    auto complete = +[](std::uint64_t data, UniffiForeignFutureResultVoid result) {
+        auto &received = *reinterpret_cast<CompletionRecord *>(data);
+        ++received.calls;
+        received.status = result.call_status.code;
+    };
+    using Trampoline = async_calls::uniffi::UniffiCallbackInterfaceTestParser;
+    const auto handle = async_calls::uniffi::FfiConverterTestParser::lower(std::make_shared<RejectedParser>());
+    UniffiForeignFutureDroppedCallbackStruct drop{};
+    Trampoline::wait(handle, reinterpret_cast<void *>(complete), reinterpret_cast<std::uint64_t>(&record), drop);
+    ASSERT_EQ(record.calls, 1u);
+    ASSERT_EQ(record.status, cancelled);
+    ASSERT_NE(drop.free, nullptr);
+    reinterpret_cast<void (*)(std::uint64_t)>(drop.free)(drop.handle);
+    ASSERT_EQ(record.calls, 1u);
+    Trampoline::uniffi_free(handle);
+}
+
+// A delayed callback startup stays rejected if its state was rejected or cancelled before restart.
+void test_foreign_states_across_restart() {
+    using State = async_calls::uniffi::ForeignFutureTaskState;
+    auto rejected = std::make_shared<State>();
+    rejected->start(rejected);
+    uniffi::start_async_executor();
+    ASSERT_FALSE(rejected->can_start());
+
+    auto previous = std::make_shared<State>();
+    previous->start(previous);
+    ASSERT_TRUE(previous->can_start());
+    uniffi::shutdown_async_executor();
+    uniffi::start_async_executor();
+    ASSERT_FALSE(previous->can_start());
+    ASSERT_FALSE(previous->finish());
+    uniffi::shutdown_async_executor();
 }
 
 } // namespace executor_tests

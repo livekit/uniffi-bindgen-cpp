@@ -106,7 +106,11 @@ test_case(error_types_builtin)
 test_case(reserved_field_name)
 test_case(type_flattening)
 list(APPEND BINDING_FILES ${BINDINGS_SRC_DIR}/async_calls.cpp)
-test_case(async_executor tests/async_executor/ffi_lifecycle.cpp)
+test_case(futures)
+target_sources(futures-test PRIVATE ${BINDINGS_SRC_DIR}/async_calls.cpp)
+test_case(async_api_client)
+test_case(async_executor tests/async_executor/ffi_lifecycle.cpp tests/async_executor/peer.cpp
+    ${BINDINGS_SRC_DIR}/futures.cpp)
 test_case(async_pending_at_exit ${BINDINGS_SRC_DIR}/async_calls.cpp)
 
 add_executable(ext_types_import-test
@@ -149,9 +153,10 @@ add_custom_target(bindings ALL
     COMMENT "Generating bindings"
 )
 
-set_tests_properties(async_executor-test PROPERTIES TIMEOUT 45)
+set_tests_properties(futures-test async_api_client-test async_executor-test PROPERTIES TIMEOUT 45)
 set_tests_properties(async_pending_at_exit-test PROPERTIES TIMEOUT 15)
 if(VALGRIND)
-    set_tests_properties(async_executor-test-test-memcheck PROPERTIES TIMEOUT 90)
+    set_tests_properties(futures-test-test-memcheck async_api_client-test-test-memcheck
+        async_executor-test-test-memcheck PROPERTIES TIMEOUT 90)
     set_tests_properties(async_pending_at_exit-test-test-memcheck PROPERTIES TIMEOUT 30)
 endif()
