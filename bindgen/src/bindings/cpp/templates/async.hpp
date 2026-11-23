@@ -1,26 +1,32 @@
+// Reported when UniFFI completes a cancelled Rust future.
 class AsyncCancelledError : public std::runtime_error {
   public:
     AsyncCancelledError() : std::runtime_error("UniFFI async call cancelled") {}
 };
 
+// Reported when the executor rejects a new Rust call or continuation.
 class AsyncExecutorError : public std::runtime_error {
   public:
     AsyncExecutorError() : std::runtime_error("UniFFI async executor rejected a task") {}
 };
 
+// Used for queued tasks and registered cancellation actions.
 using AsyncTask = std::function<void()>;
 
 namespace detail {
 
-// One control executor per linked C++ image, shared by all generated components. Tasks must not
-// block.
+// Generated components in a linked C++ image share one worker and its FIFO queue.
+// Keep worker tasks short. Shutdown also tracks first polls that run on calling threads.
 class AsyncExecutor {
   public:
     AsyncExecutor() : worker_([this] { run(); }) {}
     AsyncExecutor(const AsyncExecutor &) = delete;
     AsyncExecutor &operator=(const AsyncExecutor &) = delete;
+
+    // Destroy a directly owned executor on an application thread so it can join its worker.
     ~AsyncExecutor() { shutdown(); }
 
+    // Queue a task, including cleanup after admission closes. Returns false once stopped.
     bool enqueue(AsyncTask task) {
         {
             std::lock_guard<std::mutex> guard(mutex_);
@@ -33,8 +39,8 @@ class AsyncExecutor {
         return true;
     }
 
-    // Registers a call. With poll_on_caller, also reports whether its first poll may run on the
-    // calling thread; a true answer must be followed by run_inline().
+    // Register a cancel action and return its ID, or zero if admission is closed.
+    // When the poll_on_caller output is true, finish that first poll through run_inline().
     uint64_t track(AsyncTask cancel, bool *poll_on_caller = nullptr) {
         std::lock_guard<std::mutex> guard(mutex_);
         if (!accepting_.load(std::memory_order_relaxed)) {
@@ -51,6 +57,7 @@ class AsyncExecutor {
         return id;
     }
 
+    // Remove a registration so a waiting shutdown can recheck whether work has drained.
     void untrack(uint64_t id) noexcept {
         std::lock_guard<std::mutex> guard(mutex_);
         active_.erase(id);
@@ -59,10 +66,13 @@ class AsyncExecutor {
         }
     }
 
+    // Admission stays open while shutdown waits for caller-thread first polls.
     bool accepting() const noexcept { return accepting_.load(std::memory_order_acquire); }
 
+    // Identifies the worker for blocking wait and lifecycle checks.
     bool is_worker() const noexcept { return current_worker_ == this; }
 
+    // Run the first poll counted by track() and release its count so shutdown can proceed.
     template <typename Call> void run_inline(Call call) noexcept {
         const auto previous = current_inline_;
         current_inline_ = this;
@@ -75,6 +85,7 @@ class AsyncExecutor {
         }
     }
 
+    // Restart the worker and reopen admission after a completed shutdown.
     void start() {
         if (is_worker() || current_inline_ == this) {
             // Shutdown may be waiting for this call to finish.
@@ -89,6 +100,8 @@ class AsyncExecutor {
         }
     }
 
+    // Wait for caller-thread first polls, then close admission, cancel and drain work, and join.
+    // New calls queue their first poll on the worker during the initial wait.
     void shutdown() {
         if (is_worker() || current_inline_ == this) {
             throw std::logic_error("UniFFI executor cannot shut down from its own callback");
@@ -169,6 +182,7 @@ class AsyncExecutor {
     std::thread worker_;
 };
 
+// Get the shared executor, creating its worker on first use.
 inline AsyncExecutor &async_executor() {
     // Explicit shutdown avoids running callbacks or joining during static destruction.
     static auto *const executor = new AsyncExecutor();
@@ -186,6 +200,7 @@ inline bool enqueue_async(AsyncTask task) noexcept {
 
 inline bool begin_async_call() { return async_executor().accepting(); }
 
+// Reject a wait that would block the executor's worker.
 inline void check_blocking_wait(bool ready) {
     if (!ready && async_executor().is_worker()) {
         throw std::logic_error("Cannot block the UniFFI executor; use Future::then instead");
@@ -202,15 +217,17 @@ template <> struct ForeignFutureSuccess<void> {
 
 } // namespace detail
 
-// Cancels in-flight calls, drains their Rust handles and queued completions, and joins the worker.
-// Stop producers first. Call from an application thread before unloading the bindings or Rust.
+// Joins the shared worker after waiting for first polls, cancelling calls, and draining cleanup.
+// Stop producers first and call from an application thread before unloading the bindings or Rust.
+// Calling from the worker or inside a caller-thread first poll throws std::logic_error.
 inline void shutdown_async_executor() { detail::async_executor().shutdown(); }
 
-// Reopen admission and start a worker after the previous worker has joined.
+// Start the shared worker or reopen admission after shutdown.
+// Calls from the worker or inside a caller-thread first poll return immediately.
 inline void start_async_executor() { detail::async_executor().start(); }
 
-// C++17 adapter for an async callback-interface method. The implementation starts work when the
-// generated bridge supplies success and failure callbacks, and returns an optional cancel action.
+// A deferred C++ callback result that Rust can await. The bridge calls start() on the worker.
+// The supplied success and failure callbacks may be called from any thread.
 template <typename T> class ForeignFuture {
   public:
     using Cancel = std::function<void()>;
@@ -226,6 +243,7 @@ template <typename T> class ForeignFuture {
     ForeignFuture(ForeignFuture &&) noexcept = default;
     ForeignFuture &operator=(ForeignFuture &&) noexcept = default;
 
+    // Invoke the stored start function once and return its optional cancellation action.
     Cancel start(Success success, Failure failure) && {
         if (!start_) {
             throw std::logic_error("UniFFI foreign future is invalid or has already been started");
@@ -238,6 +256,7 @@ template <typename T> class ForeignFuture {
     Start start_;
 };
 
+// Carries the lifted value or exception delivered when an async call completes.
 template <typename T> class FutureResult {
   public:
     explicit FutureResult(T value) : value_(std::move(value)) {}
@@ -261,6 +280,7 @@ template <typename T> class FutureResult {
     bool has_value() const noexcept { return !error_; }
     std::exception_ptr error() const noexcept { return error_; }
 
+    // Move out the value or rethrow the stored exception.
     T get() && {
         if (error_) {
             std::rethrow_exception(error_);
@@ -273,6 +293,7 @@ template <typename T> class FutureResult {
     std::exception_ptr error_;
 };
 
+// Carries completion or an exception for a void result.
 template <> class FutureResult<void> {
   public:
     FutureResult() = default;
@@ -281,6 +302,7 @@ template <> class FutureResult<void> {
     bool has_value() const noexcept { return !error_; }
     std::exception_ptr error() const noexcept { return error_; }
 
+    // Observe completion, rethrowing a stored exception.
     void get() const {
         if (error_) {
             std::rethrow_exception(error_);
@@ -394,10 +416,12 @@ template <typename T> class FutureCompletionState {
 
 } // namespace detail
 
+// Copyable handle for requesting cancellation from any thread.
 class FutureCancelHandle {
   public:
     FutureCancelHandle() = default;
 
+    // Request cancellation if the call is still active.
     void cancel() const noexcept {
         if (cancel_) {
             cancel_();
@@ -413,6 +437,8 @@ class FutureCancelHandle {
     std::function<void()> cancel_;
 };
 
+// Move-only token returned by Future::then(). Destroying it requests cancellation.
+// Use the token from one thread at a time.
 class FutureContinuation {
   public:
     FutureContinuation() = default;
@@ -436,8 +462,10 @@ class FutureContinuation {
 
     ~FutureContinuation() { cancel(); }
 
+    // Give up cancellation ownership so the call can continue after the token is destroyed.
     void detach() noexcept { cancel_ = nullptr; }
 
+    // Request cancellation. The worker still delivers the eventual result.
     void cancel() noexcept {
         if (cancel_) {
             auto cancel = std::move(cancel_);
@@ -450,6 +478,9 @@ class FutureContinuation {
     std::function<void()> cancel_;
 };
 
+// Move-only handle to an async Rust call. Destroying it while incomplete requests cancellation.
+// Use the future from one thread at a time and use cancel_handle() for cross-thread cancellation.
+// Blocking waits on the executor's worker throw std::logic_error.
 template <typename T> class Future {
   public:
     using Result = FutureResult<T>;
@@ -482,8 +513,10 @@ template <typename T> class Future {
 
     bool valid() const noexcept { return state_ != nullptr; }
 
+    // Take an independent handle before consuming or moving this future.
     [[nodiscard]] FutureCancelHandle cancel_handle() const { return FutureCancelHandle(cancel_); }
 
+    // Wait for completion and consume the result, rethrowing any stored error.
     decltype(auto) get() {
         require_state();
         detail::check_blocking_wait(state_->wait_for(std::chrono::seconds(0)) ==
@@ -493,17 +526,20 @@ template <typename T> class Future {
         return state->get();
     }
 
+    // Wait for readiness and keep the result available for get() or then().
     void wait() const {
         require_state();
         state_->wait();
     }
 
+    // Wait up to timeout. A nonpositive timeout checks readiness immediately.
     template <typename Rep, typename Period>
     std::future_status wait_for(const std::chrono::duration<Rep, Period> &timeout) const {
         require_state();
         return state_->wait_for(timeout);
     }
 
+    // Consume this future and deliver its result on the worker. The returned token owns cancellation.
     [[nodiscard]] FutureContinuation then(Callback callback) && {
         require_state();
         if (!callback) {
@@ -516,6 +552,7 @@ template <typename T> class Future {
         return FutureContinuation(std::move(cancel));
     }
 
+    // Request cancellation and keep the result available for get() or then().
     void cancel() noexcept {
         if (cancel_) {
             auto cancel = std::move(cancel_);
