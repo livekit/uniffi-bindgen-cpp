@@ -278,6 +278,33 @@ void test_shutdown_cancels_before_repoll() {
     uniffi::start_async_executor();
 }
 
+// Shutdown cancels a pending Rust call whose first poll comes after admission closes.
+void test_shutdown_cancels_before_first_poll() {
+    auto &executor = uniffi::detail::async_executor();
+    PausedTask before_first_poll;
+    PausedTask before_call_cancellation;
+
+    // Register first to pause shutdown after it closes admission and before it cancels the call.
+    const auto blocker = executor.track([&] { before_call_cancellation.pause(); });
+    ASSERT_NE(blocker, 0u);
+
+    // Hold the worker so the call's first poll stays queued until admission has closed.
+    ASSERT_TRUE(executor.enqueue([&] { before_first_poll.pause(); }));
+    before_first_poll.wait_until_paused();
+    auto future = futures::wait_using_parser(std::make_shared<RejectedParser>());
+
+    auto stopping = std::async(std::launch::async, [] { uniffi::shutdown_async_executor(); });
+    before_call_cancellation.wait_until_paused();
+    ASSERT_FALSE(executor.accepting());
+    before_first_poll.resume();
+    EXPECT_EXCEPTION(wait_for_future(future), uniffi::AsyncCancelledError);
+
+    executor.untrack(blocker);
+    before_call_cancellation.resume();
+    wait_for_future(stopping);
+    uniffi::start_async_executor();
+}
+
 } // namespace
 
 void test_rust_future_lifecycle() {
@@ -288,6 +315,7 @@ void test_rust_future_lifecycle() {
     test_result_publication_move_failure();
     test_continuation_move_failure();
     test_shutdown_cancels_before_repoll();
+    test_shutdown_cancels_before_first_poll();
 }
 
 // Close admission after the start check while the caller still owns the new Rust handle.
