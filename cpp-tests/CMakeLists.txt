@@ -4,10 +4,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Keep fixture assertions active in Release builds.
 if (MSVC)
-    add_compile_options(/permissive-)
+    add_compile_options(/permissive- /UNDEBUG)
 else()
-    add_compile_options(-pedantic-errors)
+    add_compile_options(-pedantic-errors -UNDEBUG)
 endif()
 
 include(CTest)
@@ -20,7 +21,7 @@ set(BINDINGS_SRC_DIR ${BINDINGS_BUILD_DIR}/bindings)
 
 if (WIN32)
     set(UNIFFI_FIXTURES_LIB uniffi_bindgen_cpp_fixtures.dll)
-    set(ADDITIONAL_LIBS ws2_32 userenv advapi32 ntdll crypt32 Bcrypt)
+    set(ADDITIONAL_LIBS ws2_32 userenv advapi32 ntdll crypt32 Bcrypt synchronization)
 elseif(UNIX AND NOT APPLE)
     set(UNIFFI_FIXTURES_LIB libuniffi_bindgen_cpp_fixtures.so)
     set(ADDITIONAL_LIBS)
@@ -41,6 +42,22 @@ if (VALGRIND)
         --show-leak-kinds=definite $<TARGET_FILE:${TEST_NAME}>)
 endif()
 endmacro(memcheck_test)
+
+# Compile the runtime template directly for tests that need no generated bindings.
+function(runtime_test TEST_NAME)
+    add_executable(${TEST_NAME}-test tests/${TEST_NAME}/main.cpp ${ARGN})
+    target_include_directories(${TEST_NAME}-test PRIVATE include
+        ../bindgen/src/bindings/cpp/templates)
+    target_link_libraries(${TEST_NAME}-test PRIVATE Threads::Threads)
+    add_test(NAME ${TEST_NAME}-test COMMAND ${TEST_NAME}-test)
+    set_tests_properties(${TEST_NAME}-test PROPERTIES TIMEOUT 45)
+    memcheck_test(${TEST_NAME}-test)
+    if(VALGRIND)
+        set_tests_properties(${TEST_NAME}-test-test-memcheck PROPERTIES TIMEOUT 90)
+    endif()
+endfunction()
+
+runtime_test(async_executor_unit tests/async_executor_unit/peer.cpp)
 
 # Add a bindings test case
 macro(test_case TEST_NAME)
