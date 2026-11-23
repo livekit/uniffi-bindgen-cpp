@@ -4,20 +4,19 @@
 // Scripted Rust FFI functions record the call order so we can verify repolling on WAKE, completion
 // on READY, and exactly one free on success, cancellation, Rust errors, or C++ conversion failures.
 // The stream tests in main.cpp exercise the same binding through its public API.
-#include "futures.cpp"
+#include "async_calls.cpp"
 
 namespace executor_tests {
 namespace {
 
 // https://mozilla.github.io/uniffi-rs/latest/internals/async-ffi.html#managing-the-rustfuture-handle
-constexpr std::uint64_t rust_handle = 0xfedcba9801234567ULL;
 constexpr std::int8_t ready = 0;
 constexpr std::int8_t wake = 1;
 constexpr std::int8_t unexpected_error = 2;
 constexpr std::int8_t cancelled = 3;
 
 enum class Step { Start, Poll, Cancel, Complete, Free };
-enum class PollReply { Park, WakeInline, Ready };
+enum class PollReply { Park, WakeInline, Ready, Invalid };
 enum class Completion { Value, ErrorStatus, LiftError };
 
 struct PollCallback {
@@ -27,9 +26,30 @@ struct PollCallback {
     void notify(std::int8_t result) const { callback(data, result); }
 };
 
+class PausedTask {
+  public:
+    void pause() {
+        paused_.set_value();
+        wait_for_future(resume_signal_);
+    }
+
+    void wait_until_paused() { wait_for_future(paused_signal_); }
+    void resume() { resumed_.set_value(); }
+
+  private:
+    std::promise<void> paused_;
+    std::future<void> paused_signal_ = paused_.get_future();
+    std::promise<void> resumed_;
+    std::future<void> resume_signal_ = resumed_.get_future();
+};
+
 class RustFutureProbe {
   public:
-    explicit RustFutureProbe(std::initializer_list<PollReply> replies) : replies_(replies) {}
+    explicit RustFutureProbe(std::vector<PollReply> replies, PausedTask *pause = nullptr)
+        : replies_(std::move(replies)), pause_(pause) {}
+
+    RustFutureProbe(std::initializer_list<PollReply> replies)
+        : RustFutureProbe(std::vector<PollReply>(replies)) {}
 
     uniffi::Future<int> start(Completion completion = Completion::Value) {
         return start_with_lift([](int value) { return value + 1; }, completion);
@@ -38,35 +58,33 @@ class RustFutureProbe {
     template <typename Lift>
     uniffi::Future<std::invoke_result_t<Lift, int>>
     start_with_lift(Lift lift, Completion completion = Completion::Value) {
-        return futures::uniffi::rust_call_async<std::invoke_result_t<Lift, int>>(
+        return async_calls::uniffi::rust_call_async<std::invoke_result_t<Lift, int>>(
             [this] {
-                ASSERT_FALSE(uniffi::detail::async_executor().is_worker());
+                caller_ = std::this_thread::get_id();
                 record(Step::Start);
-                return rust_handle;
+                return reinterpret_cast<std::uint64_t>(this);
             },
-            [this](auto handle, auto callback, auto data) { poll(handle, {callback, data}); },
-            [this](auto handle) {
-                record_on_worker(handle, Step::Cancel);
-                ASSERT_TRUE(parked_callback_.has_value());
-                was_cancelled_ = true;
-                const auto callback = *parked_callback_;
-                parked_callback_.reset();
-                callback.notify(ready);
+            [](std::uint64_t handle, RustFutureContinuationCallback callback, std::uint64_t data) {
+                from_handle(handle).poll(handle, {callback, data});
+            },
+            [](std::uint64_t handle) {
+                from_handle(handle).cancel(handle);
             },
             [this, completion](auto handle, auto *status) {
-                record_on_worker(handle, Step::Complete);
+                record_ffi(handle, Step::Complete, replies_.front() == PollReply::Ready);
                 ASSERT_NE(status, nullptr);
                 if (was_cancelled_) {
                     status->code = cancelled;
                 } else if (completion == Completion::ErrorStatus) {
                     status->code = unexpected_error;
-                    status->error_buf = futures::uniffi::FfiConverterString::lower("Rust completion failed");
+                    status->error_buf = async_calls::uniffi::FfiConverterString::lower("Rust completion failed");
                 }
                 return 41;
             },
-            [this](auto handle) {
-                record_on_worker(handle, Step::Free);
-                handle_freed = true;
+            [](std::uint64_t handle) {
+                auto &probe = from_handle(handle);
+                probe.record_ffi(handle, Step::Free, probe.replies_.front() == PollReply::Ready);
+                probe.handle_freed = true;
             },
             [this, completion, lift = std::move(lift)](int value) mutable {
                 ASSERT_FALSE(was_cancelled_);
@@ -95,21 +113,39 @@ class RustFutureProbe {
     std::atomic<bool> handle_freed{false};
 
   private:
+    static RustFutureProbe &from_handle(std::uint64_t handle) {
+        return *reinterpret_cast<RustFutureProbe *>(handle);
+    }
+
+    void cancel(std::uint64_t handle) {
+        record_ffi(handle, Step::Cancel, false);
+        was_cancelled_ = true;
+        if (parked_callback_) {
+            const auto callback = *parked_callback_;
+            parked_callback_.reset();
+            callback.notify(ready);
+        }
+    }
+
     void record(Step step) {
         const std::lock_guard<std::mutex> lock(mutex_);
         steps_.push_back(step);
     }
 
-    void record_on_worker(std::uint64_t handle, Step step) {
-        ASSERT_EQ(handle, rust_handle);
-        ASSERT_TRUE(uniffi::detail::async_executor().is_worker());
+    void record_ffi(std::uint64_t handle, Step step, bool on_caller) {
+        ASSERT_EQ(handle, reinterpret_cast<std::uint64_t>(this));
+        if (on_caller) {
+            ASSERT_EQ(std::this_thread::get_id(), caller_);
+        } else {
+            ASSERT_TRUE(uniffi::detail::async_executor().is_worker());
+        }
         // Even an inline Rust notification must return before the next FFI operation.
         ASSERT_FALSE(in_poll_);
         record(step);
     }
 
     void poll(std::uint64_t handle, PollCallback callback) {
-        record_on_worker(handle, Step::Poll);
+        record_ffi(handle, Step::Poll, next_reply_ == 0);
         ASSERT_NE(callback.callback, nullptr);
         ASSERT_NE(callback.data, 0u);
         ASSERT_TRUE(next_reply_ < replies_.size());
@@ -119,6 +155,9 @@ class RustFutureProbe {
         }
 
         in_poll_ = true;
+        if (next_reply_ == 0) {
+            EXPECT_EXCEPTION(uniffi::shutdown_async_executor(), std::logic_error);
+        }
         switch (replies_[next_reply_++]) {
         case PollReply::Park:
             parked_callback_ = callback;
@@ -130,11 +169,19 @@ class RustFutureProbe {
         case PollReply::Ready:
             callback.notify(ready);
             break;
+        case PollReply::Invalid:
+            callback.notify(-1);
+            break;
+        }
+        if (next_reply_ == 1 && pause_) {
+            pause_->pause();
         }
         in_poll_ = false;
     }
 
     const std::vector<PollReply> replies_;
+    PausedTask *const pause_;
+    std::thread::id caller_;
     std::size_t next_reply_ = 0;
     std::mutex mutex_;
     std::vector<Step> steps_;
@@ -144,6 +191,27 @@ class RustFutureProbe {
     bool in_poll_ = false;
     bool was_cancelled_ = false;
 };
+
+// A ready first poll completes on the caller even while the worker is paused.
+void test_first_poll_runs_on_caller() {
+    PausedTask worker;
+    ASSERT_TRUE(uniffi::detail::async_executor().enqueue([&] { worker.pause(); }));
+    worker.wait_until_paused();
+
+    RustFutureProbe immediate{PollReply::Ready};
+    auto ready_result = immediate.start();
+    ASSERT_EQ(wait_for_future(ready_result, std::chrono::seconds(0)), 42);
+    immediate.expect_steps({Step::Start, Step::Poll, Step::Complete, Step::Free});
+
+    RustFutureProbe deferred{PollReply::WakeInline, PollReply::Ready};
+    auto pending_result = deferred.start();
+    ASSERT_EQ(pending_result.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+    deferred.expect_steps({Step::Start, Step::Poll});
+
+    worker.resume();
+    ASSERT_EQ(wait_for_future(pending_result), 42);
+    deferred.expect_steps({Step::Start, Step::Poll, Step::Poll, Step::Complete, Step::Free});
+}
 
 void test_pending_to_ready() {
     RustFutureProbe probe{PollReply::Park, PollReply::WakeInline, PollReply::Ready};
@@ -155,6 +223,41 @@ void test_pending_to_ready() {
     probe.wake_from_caller(callback);
     ASSERT_EQ(wait_for_future(future), 42);
     probe.expect_steps({Step::Start, Step::Poll, Step::Poll, Step::Poll, Step::Complete, Step::Free});
+}
+
+// A future that wakes itself repeatedly yields the worker to other queued tasks.
+void test_rapid_wakes_yield() {
+    auto &executor = uniffi::detail::async_executor();
+    PausedTask worker;
+    ASSERT_TRUE(executor.enqueue([&] { worker.pause(); }));
+    worker.wait_until_paused();
+
+    std::vector<PollReply> replies(128, PollReply::WakeInline);
+    replies.push_back(PollReply::Ready);
+    RustFutureProbe probe(std::move(replies));
+    auto future = probe.start();
+
+    std::promise<void> yielded;
+    auto reached = yielded.get_future();
+    ASSERT_TRUE(executor.enqueue([&] {
+        ASSERT_FALSE(probe.handle_freed.load());
+        yielded.set_value();
+    }));
+    worker.resume();
+    wait_for_future(reached);
+    ASSERT_EQ(wait_for_future(future), 42);
+}
+
+// A bad poll code becomes a C++ error after the Rust handle is freed.
+void test_invalid_poll_code() {
+    RustFutureProbe probe{PollReply::Invalid, PollReply::Ready};
+    try {
+        wait_for_future(probe.start());
+        assert(false && "expected an invalid poll result to throw");
+    } catch (const std::runtime_error &error) {
+        ASSERT_EQ(std::string(error.what()), "Unexpected UniFFI Rust future poll result");
+    }
+    probe.expect_steps({Step::Start, Step::Poll, Step::Cancel, Step::Poll, Step::Complete, Step::Free});
 }
 
 void test_cleanup_on_failure(Completion completion, const char *message) {
@@ -218,7 +321,7 @@ void test_continuation_move_failure() {
     probe.expect_steps({Step::Start, Step::Poll, Step::Complete, Step::Free});
 }
 
-class RejectedParser final : public futures::AsyncParserForeign {
+class RejectedParser final : public async_calls::TestParserForeign {
   public:
     uniffi::ForeignFuture<std::string> stringify(std::int32_t) override { return {}; }
     uniffi::ForeignFuture<std::int32_t> parse(const std::string &) override { return {}; }
@@ -228,22 +331,60 @@ class RejectedParser final : public futures::AsyncParserForeign {
     }
 };
 
-class PausedTask {
+class DeferredParser final : public async_calls::TestParserForeign {
   public:
-    void pause() {
-        paused_.set_value();
-        wait_for_future(resume_signal_);
+    uniffi::ForeignFuture<std::string> stringify(std::int32_t) override { return {}; }
+    uniffi::ForeignFuture<std::int32_t> parse(const std::string &) override { return {}; }
+    uniffi::ForeignFuture<void> wait() override {
+        return uniffi::ForeignFuture<void>([this](auto success, auto) {
+            completing.set_value(std::move(success));
+            return [this] { ++cancellations; };
+        });
     }
 
-    void wait_until_paused() { wait_for_future(paused_signal_); }
-    void resume() { resumed_.set_value(); }
-
-  private:
-    std::promise<void> paused_;
-    std::future<void> paused_signal_ = paused_.get_future();
-    std::promise<void> resumed_;
-    std::future<void> resume_signal_ = resumed_.get_future();
+    std::promise<uniffi::ForeignFuture<void>::Success> completing;
+    unsigned cancellations = 0;
 };
+
+// A success queued while Rust's drop is being processed cannot complete the callback a second time.
+void test_completion_after_foreign_drop() {
+    auto &executor = uniffi::detail::async_executor();
+    struct CompletionRecord {
+        unsigned calls = 0;
+        std::int8_t status = -1;
+    } record;
+    auto complete = +[](std::uint64_t data, UniffiForeignFutureResultVoid result) {
+        auto &received = *reinterpret_cast<CompletionRecord *>(data);
+        ++received.calls;
+        received.status = result.call_status.code;
+    };
+
+    auto parser = std::make_shared<DeferredParser>();
+    auto completing = parser->completing.get_future();
+    using Trampoline = async_calls::uniffi::UniffiCallbackInterfaceTestParser;
+    const auto handle = async_calls::uniffi::FfiConverterTestParser::lower(parser);
+    UniffiForeignFutureDroppedCallbackStruct drop{};
+    Trampoline::wait(handle, reinterpret_cast<void *>(complete),
+                     reinterpret_cast<std::uint64_t>(&record), drop);
+    auto success = wait_for_future(completing);
+
+    PausedTask worker;
+    ASSERT_TRUE(executor.enqueue([&] { worker.pause(); }));
+    worker.wait_until_paused();
+    ASSERT_NE(drop.free, nullptr);
+    reinterpret_cast<void (*)(std::uint64_t)>(drop.free)(drop.handle);
+    success();
+
+    std::promise<void> drained;
+    auto barrier = drained.get_future();
+    ASSERT_TRUE(executor.enqueue([&] { drained.set_value(); }));
+    worker.resume();
+    wait_for_future(barrier);
+    ASSERT_EQ(record.calls, 1u);
+    ASSERT_EQ(record.status, cancelled);
+    ASSERT_EQ(parser->cancellations, 1u);
+    Trampoline::uniffi_free(handle);
+}
 
 // Shutdown cancels a pending Rust call before it can consume a rejected C++ callback result.
 void test_shutdown_cancels_before_repoll() {
@@ -255,16 +396,9 @@ void test_shutdown_cancels_before_repoll() {
     const auto blocker = executor.track([&] { before_call_cancellation.pause(); });
     ASSERT_NE(blocker, 0u);
 
-    std::promise<uniffi::Future<void>> call;
-    auto handoff = call.get_future();
-    ASSERT_TRUE(executor.enqueue([&] {
-        auto future = futures::wait_using_parser(std::make_shared<RejectedParser>());
-        // The first poll queues the callback startup behind this pause.
-        ASSERT_TRUE(executor.enqueue([&] { before_callback_start.pause(); }));
-        call.set_value(std::move(future));
-    }));
-    auto future = wait_for_future(handoff);
+    ASSERT_TRUE(executor.enqueue([&] { before_callback_start.pause(); }));
     before_callback_start.wait_until_paused();
+    auto future = async_calls::wait_using_parser(std::make_shared<RejectedParser>());
 
     auto stopping = std::async(std::launch::async, [] { uniffi::shutdown_async_executor(); });
     before_call_cancellation.wait_until_paused();
@@ -278,44 +412,51 @@ void test_shutdown_cancels_before_repoll() {
     uniffi::start_async_executor();
 }
 
-// Shutdown cancels a pending Rust call whose first poll comes after admission closes.
-void test_shutdown_cancels_before_first_poll() {
+// Shutdown waits for an in-flight caller-thread poll before cancelling and freeing the handle.
+void test_shutdown_during_first_poll() {
     auto &executor = uniffi::detail::async_executor();
-    PausedTask before_first_poll;
-    PausedTask before_call_cancellation;
+    PausedTask first_poll;
+    RustFutureProbe probe({PollReply::Park}, &first_poll);
+    auto call = std::async(std::launch::async, [&] { return probe.start(); });
+    first_poll.wait_until_paused();
 
-    // Register first to pause shutdown after it closes admission and before it cancels the call.
-    const auto blocker = executor.track([&] { before_call_cancellation.pause(); });
-    ASSERT_NE(blocker, 0u);
-
-    // Hold the worker so the call's first poll stays queued until admission has closed.
-    ASSERT_TRUE(executor.enqueue([&] { before_first_poll.pause(); }));
-    before_first_poll.wait_until_paused();
-    auto future = futures::wait_using_parser(std::make_shared<RejectedParser>());
+    std::promise<void> cancelling;
+    auto cancellation_requested = cancelling.get_future();
+    const std::uint64_t observer = executor.track([&] {
+        executor.untrack(observer);
+        cancelling.set_value();
+    });
+    ASSERT_NE(observer, 0u);
 
     auto stopping = std::async(std::launch::async, [] { uniffi::shutdown_async_executor(); });
-    before_call_cancellation.wait_until_paused();
+    wait_for_future(cancellation_requested);
     ASSERT_FALSE(executor.accepting());
-    before_first_poll.resume();
-    EXPECT_EXCEPTION(wait_for_future(future), uniffi::AsyncCancelledError);
+    ASSERT_EQ(stopping.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+    probe.expect_steps({Step::Start, Step::Poll});
 
-    executor.untrack(blocker);
-    before_call_cancellation.resume();
+    first_poll.resume();
+    auto future = wait_for_future(call);
+    EXPECT_EXCEPTION(wait_for_future(future), uniffi::AsyncCancelledError);
     wait_for_future(stopping);
+    probe.expect_steps({Step::Start, Step::Poll, Step::Cancel, Step::Complete, Step::Free});
     uniffi::start_async_executor();
 }
 
 } // namespace
 
 void test_rust_future_lifecycle() {
+    test_first_poll_runs_on_caller();
     test_pending_to_ready();
+    test_rapid_wakes_yield();
+    test_invalid_poll_code();
     test_cleanup_on_failure(Completion::ErrorStatus, "Rust completion failed");
     test_cleanup_on_failure(Completion::LiftError, "C++ lifting failed");
     test_cancellation_lifecycle();
     test_result_publication_move_failure();
     test_continuation_move_failure();
+    test_completion_after_foreign_drop();
     test_shutdown_cancels_before_repoll();
-    test_shutdown_cancels_before_first_poll();
+    test_shutdown_during_first_poll();
 }
 
 // Close admission after the start check while the caller still owns the new Rust handle.
@@ -323,18 +464,18 @@ void test_shutdown_during_handle_creation() {
     unsigned frees = 0;
     const auto unexpected_ffi_call = [](auto...) {
         assert(false && "the rejected Rust future entered the driver");
-        return 0;
     };
-    auto result = futures::uniffi::rust_call_async<int>(
-        [] {
+    auto result = async_calls::uniffi::rust_call_async<int>(
+        [&] {
             uniffi::shutdown_async_executor();
-            return rust_handle;
+            return reinterpret_cast<std::uint64_t>(&frees);
         },
-        unexpected_ffi_call, unexpected_ffi_call, unexpected_ffi_call,
-        [&](std::uint64_t handle) {
-            ASSERT_EQ(handle, rust_handle);
-            ++frees;
+        unexpected_ffi_call, unexpected_ffi_call,
+        [unexpected_ffi_call](auto... args) {
+            unexpected_ffi_call(args...);
+            return 0;
         },
+        [](std::uint64_t handle) { ++*reinterpret_cast<unsigned *>(handle); },
         [](int value) { return value; }, nullptr);
     EXPECT_EXCEPTION(wait_for_future(result), uniffi::AsyncExecutorError);
     ASSERT_EQ(frees, 1u);
@@ -351,8 +492,8 @@ void test_foreign_callback_after_shutdown() {
         ++received.calls;
         received.status = result.call_status.code;
     };
-    using Trampoline = futures::uniffi::UniffiCallbackInterfaceAsyncParser;
-    const auto handle = futures::uniffi::FfiConverterAsyncParser::lower(std::make_shared<RejectedParser>());
+    using Trampoline = async_calls::uniffi::UniffiCallbackInterfaceTestParser;
+    const auto handle = async_calls::uniffi::FfiConverterTestParser::lower(std::make_shared<RejectedParser>());
     UniffiForeignFutureDroppedCallbackStruct drop{};
     Trampoline::wait(handle, reinterpret_cast<void *>(complete), reinterpret_cast<std::uint64_t>(&record), drop);
     ASSERT_EQ(record.calls, 1u);
@@ -365,7 +506,7 @@ void test_foreign_callback_after_shutdown() {
 
 // A delayed callback startup stays rejected if its state was rejected or cancelled before restart.
 void test_foreign_states_across_restart() {
-    using State = futures::uniffi::ForeignFutureTaskState;
+    using State = async_calls::uniffi::ForeignFutureTaskState;
     auto rejected = std::make_shared<State>();
     rejected->start(rejected);
     uniffi::start_async_executor();

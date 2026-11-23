@@ -61,7 +61,7 @@ struct {{ impl_class_name }}
 
     {%- for method in obj.methods() %}
     {%- call macros::docstring(method, 4) %}
-    {% if method.is_async() %}::uniffi::Future<{% endif %}{% match method.return_type() %}{% when Some with (return_type) %}{{ return_type|type_name(ci) }}{% else %}void{% endmatch %}{% if method.is_async() %}>{% endif %} {{ method.name()|fn_name }}({% call macros::param_list(method) %});
+    {% call macros::callable_return_type(method) %} {{ method.name()|fn_name }}({% call macros::param_list(method) %});
     {%- endfor %}
 
     {%- for method in obj.uniffi_traits() %}

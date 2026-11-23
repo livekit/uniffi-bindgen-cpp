@@ -1,5 +1,6 @@
 #include <test_common.hpp>
 
+#include <async_calls.hpp>
 #include <futures.hpp>
 
 #include <atomic>
@@ -45,7 +46,15 @@ std::optional<size_t> thread_count() {
 
 using namespace std::chrono_literals;
 
-class TestAsyncParser final : public futures::AsyncParserForeign {
+template <typename Predicate> void eventually(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (!predicate()) {
+        ASSERT_TRUE(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(1ms);
+    }
+}
+
+class TestAsyncParser final : public async_calls::TestParserForeign {
   public:
     TestAsyncParser(std::shared_ptr<std::atomic<int>> started_count,
                     std::shared_ptr<std::atomic<int>> cancellation_count,
@@ -57,19 +66,33 @@ class TestAsyncParser final : public futures::AsyncParserForeign {
     ~TestAsyncParser() override { destruction_count_->fetch_add(1); }
 
     uniffi::ForeignFuture<std::string> stringify(int32_t value) override {
-        return uniffi::ForeignFuture<std::string>([value](auto success, auto) {
+        ASSERT_TRUE(::uniffi::detail::async_executor().is_worker());
+        return uniffi::ForeignFuture<std::string>([value](auto success, auto failure) {
             success(std::to_string(value));
+            // Only the first completion should reach Rust.
+            success("duplicate");
+            failure(std::make_exception_ptr(std::runtime_error("duplicate failure")));
             return [] {};
         });
     }
 
     uniffi::ForeignFuture<int32_t> parse(const std::string &value) override {
+        if (value == "throw") {
+            throw std::runtime_error("C++ callback method threw");
+        }
+        if (value == "empty") {
+            return {};
+        }
         return uniffi::ForeignFuture<int32_t>([value](auto success, auto failure) {
-            try {
-                success(std::stoi(value));
-            } catch (...) {
-                failure(std::make_exception_ptr(
-                    futures::async_parser_error::InvalidInteger("invalid integer")));
+            if (value == "unexpected") {
+                failure(std::make_exception_ptr(std::runtime_error("C++ callback failed")));
+            } else {
+                try {
+                    success(std::stoi(value));
+                } catch (...) {
+                    failure(std::make_exception_ptr(
+                        async_calls::async_parser_error::InvalidInteger("invalid integer")));
+                }
             }
             return [] {};
         });
@@ -90,45 +113,43 @@ class TestAsyncParser final : public futures::AsyncParserForeign {
     std::shared_ptr<std::atomic<int>> destruction_count_;
 };
 
+class TestGreeter final : public async_calls::AsyncGreeter {
+  public:
+    uniffi::ForeignFuture<std::string> greeting() override {
+        return uniffi::ForeignFuture<std::string>([](auto success, auto) {
+            success("Hello from a C++ callback!");
+            return nullptr;
+        });
+    }
+};
+
 int main() {
     ASSERT_EQ("Hello, C++", futures::greet("C++"));
     ASSERT_TRUE(futures::always_ready().get());
-    futures::void_return().get();
+    futures::void_().get();
     ASSERT_EQ("Hello, Future!", futures::say().get());
     ASSERT_EQ("Hello, Future!", futures::say_after(1, "Future").get());
     ASSERT_TRUE(futures::sleep(1).get());
     futures::sleep_no_return(1).get();
 
-    auto waitable = futures::say_after(20, "Wait");
-    ASSERT_EQ(std::future_status::timeout, waitable.wait_for(1ms));
+    auto waitable = futures::say_after(1, "Wait");
     waitable.wait();
     ASSERT_EQ("Hello, Wait!", waitable.get());
 
     {
-        auto pending = futures::pending();
-        for (auto i = 0; i < 100 && futures::pending_count() == 0; ++i) {
-            std::this_thread::sleep_for(1ms);
-        }
-        ASSERT_EQ(1, futures::pending_count());
+        auto pending = async_calls::pending();
+        ASSERT_EQ(std::future_status::timeout, pending.wait_for(1ms));
+        ASSERT_EQ(1, async_calls::pending_count());
         pending.cancel();
         EXPECT_EXCEPTION(pending.get(), uniffi::AsyncCancelledError);
-        for (auto i = 0; i < 100 && futures::pending_count() != 0; ++i) {
-            std::this_thread::sleep_for(1ms);
-        }
-        ASSERT_EQ(0, futures::pending_count());
+        ASSERT_EQ(0, async_calls::pending_count());
     }
 
     {
-        auto pending = futures::pending();
-        for (auto i = 0; i < 100 && futures::pending_count() == 0; ++i) {
-            std::this_thread::sleep_for(1ms);
-        }
-        ASSERT_EQ(1, futures::pending_count());
+        auto pending = async_calls::pending();
+        ASSERT_EQ(1, async_calls::pending_count());
     }
-    for (auto i = 0; i < 100 && futures::pending_count() != 0; ++i) {
-        std::this_thread::sleep_for(1ms);
-    }
-    ASSERT_EQ(0, futures::pending_count());
+    eventually([] { return async_calls::pending_count() == 0; });
 
     for (auto i = 0; i < 100; ++i) {
         auto racing = futures::say_after(1, "Race");
@@ -169,15 +190,21 @@ int main() {
     auto record = futures::new_my_record("value", 42).get();
     ASSERT_EQ("value", record.a);
     ASSERT_EQ(42, record.b);
-    auto record_value = futures::MyRecord{"value", 17}.value_after(1);
+    auto record_value = async_calls::MyRecord{"value", 17}.value_after(1);
     ASSERT_EQ(17, record_value.get());
 
-    futures::validate(futures::ValidationMode::kAllow).get();
-    EXPECT_EXCEPTION(futures::validate(futures::ValidationMode::kReject).get(),
-                     futures::my_error::Foo);
+    async_calls::validate(async_calls::ValidationMode::kAllow).get();
+    EXPECT_EXCEPTION(async_calls::validate(async_calls::ValidationMode::kReject).get(),
+                     async_calls::my_error::Foo);
+
+    for (const auto &trait : futures::get_say_after_traits()) {
+        ASSERT_EQ(trait->say_after(1, "Trait").get(), "Hello, Trait!");
+    }
+    for (const auto &trait : futures::get_say_after_udl_traits()) {
+        ASSERT_EQ(trait->say_after(1, "UDL trait").get(), "Hello, UDL trait!");
+    }
 
     auto holding = futures::use_shared_resource({2000, 4000});
-    std::this_thread::sleep_for(500ms);
     EXPECT_EXCEPTION(futures::use_shared_resource({0, 250}).get(), futures::async_error::Timeout);
     holding.get();
 
@@ -186,26 +213,35 @@ int main() {
     auto destruction_count = std::make_shared<std::atomic<int>>(0);
     auto parser =
         std::make_shared<TestAsyncParser>(started_count, cancellation_count, destruction_count);
-    ASSERT_EQ("42", futures::stringify_using_parser(parser, 42).get());
-    ASSERT_EQ(42, futures::parse_using_parser(parser, "42").get());
-    EXPECT_EXCEPTION(futures::parse_using_parser(parser, "not an integer").get(),
-                     futures::async_parser_error::InvalidInteger);
+    ASSERT_EQ("42", async_calls::stringify_using_parser(parser, 42).get());
+    ASSERT_EQ("43", async_calls::stringify_on_tokio(parser, 43).get());
+    const auto rust_parser =
+        std::dynamic_pointer_cast<async_calls::TestParserImpl>(async_calls::rust_async_parser());
+    ASSERT_TRUE(rust_parser);
+    ASSERT_EQ(rust_parser->stringify(44).get(), "44");
+    ASSERT_EQ(rust_parser->parse("45").get(), 45);
+    EXPECT_EXCEPTION(rust_parser->parse("bad input").get(),
+                     async_calls::async_parser_error::InvalidInteger);
+    ASSERT_EQ(42, async_calls::parse_using_parser(parser, "42").get());
+    EXPECT_EXCEPTION(async_calls::parse_using_parser(parser, "not an integer").get(),
+                     async_calls::async_parser_error::InvalidInteger);
+    for (const auto *input : {"unexpected", "throw", "empty"}) {
+        EXPECT_EXCEPTION(async_calls::parse_using_parser(parser, input).get(),
+                         async_calls::async_parser_error::Unexpected);
+    }
+    ASSERT_EQ(async_calls::greet_with(std::make_shared<TestGreeter>()).get(),
+              "Hello from a C++ callback!");
 
     {
-        auto waiting = futures::wait_using_parser(parser);
-        for (auto i = 0; i < 100 && started_count->load() == 0; ++i) {
-            std::this_thread::sleep_for(1ms);
-        }
+        auto waiting = async_calls::wait_using_parser(parser);
+        eventually([&] { return started_count->load() != 0; });
         ASSERT_EQ(1, started_count->load());
         parser.reset();
         ASSERT_EQ(0, destruction_count->load());
         waiting.cancel();
         EXPECT_EXCEPTION(waiting.get(), uniffi::AsyncCancelledError);
     }
-    for (auto i = 0; i < 100 && (cancellation_count->load() == 0 || destruction_count->load() == 0);
-         ++i) {
-        std::this_thread::sleep_for(1ms);
-    }
+    eventually([&] { return cancellation_count->load() != 0 && destruction_count->load() != 0; });
     ASSERT_EQ(1, cancellation_count->load());
     ASSERT_EQ(1, destruction_count->load());
 
@@ -223,10 +259,10 @@ int main() {
     const auto threads_before = thread_count();
     std::vector<uniffi::Future<void>> parked;
     for (int i = 0; i < 2000; ++i) {
-        parked.push_back(futures::pending());
+        parked.push_back(async_calls::pending());
     }
     const auto parked_deadline = std::chrono::steady_clock::now() + 5s;
-    while (futures::pending_count() != 2000) {
+    while (async_calls::pending_count() != 2000) {
         ASSERT_TRUE(std::chrono::steady_clock::now() < parked_deadline);
         std::this_thread::yield();
     }
@@ -239,15 +275,18 @@ int main() {
     for (auto &future : parked) {
         EXPECT_EXCEPTION(future.get(), uniffi::AsyncCancelledError);
     }
-    ASSERT_EQ(0, futures::pending_count());
+    ASSERT_EQ(0, async_calls::pending_count());
 
     // A continuation runs on the shared executor and cannot block it waiting on another call.
     auto callback_done = std::make_shared<std::promise<void>>();
     auto nested = std::move(futures::always_ready()).then([callback_done](auto result) {
         ASSERT_TRUE(uniffi::detail::async_executor().is_worker());
         ASSERT_TRUE(std::move(result).get());
-        auto inner = futures::pending();
+        auto inner = async_calls::pending();
         EXPECT_EXCEPTION(inner.get(), std::logic_error);
+        EXPECT_EXCEPTION(inner.wait(), std::logic_error);
+        EXPECT_EXCEPTION(inner.wait_for(1ms), std::logic_error);
+        ASSERT_EQ(inner.wait_for(0ms), std::future_status::timeout);
         EXPECT_EXCEPTION(uniffi::shutdown_async_executor(), std::logic_error);
         callback_done->set_value();
     });
@@ -277,8 +316,8 @@ int main() {
     }
     auto late_continuation = futures::always_ready();
     late_continuation.wait();
-    auto shutdown_pending = futures::pending();
-    auto shutdown_foreign = futures::wait_using_parser(
+    auto shutdown_pending = async_calls::pending();
+    auto shutdown_foreign = async_calls::wait_using_parser(
         std::make_shared<TestAsyncParser>(started_count, cancellation_count, destruction_count));
     uniffi::shutdown_async_executor();
     stop_producers.store(true);

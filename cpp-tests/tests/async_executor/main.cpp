@@ -144,8 +144,8 @@ void test_singleton_across_components() {
 
 // Two Rust streams receive independently, with bounded buffering and clean end-of-stream.
 void test_interleaved_stream_reads() {
-    const auto first = futures::SampleStream::init();
-    const auto second = futures::SampleStream::init();
+    const auto first = async_calls::SampleStream::init();
+    const auto second = async_calls::SampleStream::init();
     auto first_read = first->next();
     auto second_read = second->next();
     wait_for_queued_work(async_executor());
@@ -189,7 +189,7 @@ void test_interleaved_stream_reads() {
 
 // Cancelling a pending read releases the receiver for the next read.
 void test_cancel_pending_read() {
-    const auto stream = futures::SampleStream::init();
+    const auto stream = async_calls::SampleStream::init();
     auto read = stream->next();
     wait_for_queued_work(async_executor());
     ASSERT_TRUE(stream->is_read_pending());
@@ -204,7 +204,7 @@ void test_cancel_pending_read() {
 
 // A separate cancellation handle releases a thread waiting in get().
 void test_cancel_blocking_get() {
-    auto pending = futures::pending();
+    auto pending = async_calls::pending();
     const auto cancel = pending.cancel_handle();
     auto entering = std::make_shared<std::promise<void>>();
     auto entering_get = entering->get_future();
@@ -232,7 +232,7 @@ void test_cancel_handle_lifetime() {
     }
     finished.cancel();
 
-    auto pending = futures::pending();
+    auto pending = async_calls::pending();
     const auto cancel = pending.cancel_handle();
     auto delivered = std::make_shared<std::promise<void>>();
     auto result = delivered->get_future();
@@ -245,10 +245,49 @@ void test_cancel_handle_lifetime() {
     wait_for_future(result);
 }
 
+// A detached continuation delivers a stream read after its token is destroyed.
+void test_detached_continuation() {
+    auto stream = async_calls::SampleStream::init();
+    auto delivered = std::make_shared<std::promise<std::uint32_t>>();
+    auto result = delivered->get_future();
+    stream->next().then([delivered](auto completed) {
+        delivered->set_value(std::move(completed).get().value());
+    }).detach();
+    ASSERT_TRUE(stream->push(42));
+    ASSERT_EQ(wait_for_future(result), 42u);
+}
+
+// Move assignment cancels the previous owner and transfers the new result or continuation.
+void test_future_move_assignment() {
+    uniffi::Future<void> future;
+    ASSERT_FALSE(future.valid());
+    EXPECT_EXCEPTION(future.get(), std::future_error);
+
+    future = async_calls::pending();
+    ASSERT_EQ(async_calls::pending_count(), 1u);
+    future = futures::void_();
+    wait_for_future(future);
+
+    auto delivered = std::make_shared<std::promise<void>>();
+    auto cancellation = delivered->get_future();
+    auto continuation = async_calls::pending().then([delivered](auto result) {
+        EXPECT_EXCEPTION(std::move(result).get(), uniffi::AsyncCancelledError);
+        delivered->set_value();
+    });
+    const auto completed = std::make_shared<std::promise<bool>>();
+    auto completion = completed->get_future();
+    continuation = futures::always_ready().then([completed](auto result) {
+        completed->set_value(std::move(result).get());
+    });
+    wait_for_future(cancellation);
+    ASSERT_TRUE(wait_for_future(completion));
+    ASSERT_EQ(async_calls::pending_count(), 0u);
+}
+
 // Shutdown delivers cancellation, rejects new reads, and allows the Rust receiver to drop.
 void test_singleton_shutdown() {
-    ASSERT_EQ(futures::sample_stream_count(), 0u);
-    auto stream = futures::SampleStream::init();
+    ASSERT_EQ(async_calls::sample_stream_count(), 0u);
+    auto stream = async_calls::SampleStream::init();
     auto delivered = std::make_shared<std::promise<void>>();
     auto result = delivered->get_future();
     auto continuation = stream->next().then([delivered](auto completed) {
@@ -266,11 +305,11 @@ void test_singleton_shutdown() {
     ASSERT_FALSE(executor_from_peer().enqueue([] {}));
     EXPECT_EXCEPTION(wait_for_future(stream->next()), uniffi::AsyncExecutorError);
     stream.reset();
-    ASSERT_EQ(futures::sample_stream_count(), 0u);
+    ASSERT_EQ(async_calls::sample_stream_count(), 0u);
     uniffi::shutdown_async_executor();
 }
 
-class RestartParser final : public futures::AsyncParserForeign {
+class RestartParser final : public async_calls::TestParserForeign {
   public:
     uniffi::ForeignFuture<std::string> stringify(std::int32_t value) override {
         return uniffi::ForeignFuture<std::string>([value](auto success, auto) {
@@ -287,7 +326,7 @@ void test_singleton_restart() {
     uniffi::start_async_executor();
     uniffi::start_async_executor();
     ASSERT_TRUE(wait_for_future(futures::always_ready()));
-    ASSERT_EQ(wait_for_future(futures::stringify_using_parser(std::make_shared<RestartParser>(), 42)),
+    ASSERT_EQ(wait_for_future(async_calls::stringify_using_parser(std::make_shared<RestartParser>(), 42)),
               "42");
     uniffi::shutdown_async_executor();
     EXPECT_EXCEPTION(wait_for_future(futures::always_ready()), uniffi::AsyncExecutorError);
@@ -307,6 +346,8 @@ int main() {
     test_cancel_pending_read();
     test_cancel_blocking_get();
     test_cancel_handle_lifetime();
+    test_detached_continuation();
+    test_future_move_assignment();
     // Check shutdown rejection before explicitly restarting the singleton.
     test_singleton_shutdown();
     test_foreign_callback_after_shutdown();

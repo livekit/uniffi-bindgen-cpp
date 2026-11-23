@@ -1,14 +1,10 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <exception>
 #include <functional>
-#include <future>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -17,10 +13,18 @@
 #include <stdexcept>
 #include <streambuf>
 #include <string>
-#include <thread>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
+
+{%- if ci.has_async_fns() %}
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <future>
+#include <thread>
+{%- endif %}
 
 {%- for include in self.includes() %}
 #include <{{ include }}>
@@ -41,12 +45,16 @@ namespace uniffi {
 }
 #endif
 
-#ifndef UNIFFI_CPP_ASYNC_FUTURE
-#define UNIFFI_CPP_ASYNC_FUTURE
+{%- if ci.has_async_fns() %}
+#ifndef UNIFFI_CPP_ASYNC_FUTURE_V1
+#define UNIFFI_CPP_ASYNC_FUTURE_V1
 namespace uniffi {
+inline namespace cpp_async_v1 {
 {% include "async.hpp" %}
 }
+}
 #endif
+{%- endif %}
 
 {%- import "macros.cpp" as macros %}
 {% call macros::docstring_value(ci.namespace_docstring(), 0) %}
@@ -113,7 +121,9 @@ typedef {{ type_name }} {{ name }};
 namespace uniffi {
 using ::uniffi::RustStream;
 using ::uniffi::RustStreamBuffer;
+{%- if ci.has_async_fns() %}
 using ::uniffi::Future;
+{%- endif %}
 {%- for converter in self.external_ffi_converters() %}
 using {{ converter }};
 {%- endfor %}
@@ -185,11 +195,6 @@ void rustbuffer_free(RustBuffer);
 
 {%~ for func in ci.function_definitions() %}
 {%- call macros::docstring(func, 0) %}
-{% if func.is_async() %}uniffi::Future<{% endif %}{% match func.return_type() %}
-{%- when Some with (return_type) %}
-{{ return_type|type_name(ci) }}{% if func.is_async() %}>{% endif %} {{ func.name()|fn_name }}({% call macros::param_list(func) %});
-{%- when None %}
-void{% if func.is_async() %}>{% endif %} {{ func.name()|fn_name }}({% call macros::param_list(func) %});
-{%- endmatch %}
+{% call macros::callable_return_type(func) %} {{ func.name()|fn_name }}({% call macros::param_list(func) %});
 {%- endfor %}
 } // namespace {{ namespace }}

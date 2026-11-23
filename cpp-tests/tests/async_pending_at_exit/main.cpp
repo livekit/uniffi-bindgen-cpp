@@ -1,4 +1,4 @@
-#include <futures.hpp>
+#include <async_calls.hpp>
 
 #include <cstdlib>
 #include <future>
@@ -13,9 +13,9 @@ uniffi::FutureContinuation *volatile pending_continuation;
 } // namespace
 
 int main() {
-    pending_future = new uniffi::Future<void>(futures::pending());
+    pending_future = new uniffi::Future<void>(async_calls::pending());
     pending_continuation = new uniffi::FutureContinuation(
-        futures::pending().then([](auto) { std::abort(); }));
+        async_calls::pending().then([](auto) { std::abort(); }));
 
     auto barrier = std::make_shared<std::promise<void>>();
     auto polled = barrier->get_future();
@@ -23,5 +23,5 @@ int main() {
         return EXIT_FAILURE;
     }
     polled.get();
-    return futures::pending_count() == 2 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return async_calls::pending_count() == 2 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

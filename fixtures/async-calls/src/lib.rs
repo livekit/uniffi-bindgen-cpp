@@ -4,9 +4,6 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-mod platform_specific;
-use platform_specific::acquire_with_timeout;
-
 use futures_timer::Delay;
 use std::{
     sync::{
@@ -26,41 +23,6 @@ impl Drop for PendingGuard {
     fn drop(&mut self) {
         PENDING_COUNT.fetch_sub(1, Ordering::SeqCst);
     }
-}
-
-#[uniffi::export]
-pub fn greet(who: String) -> String {
-    format!("Hello, {who}")
-}
-
-pub async fn always_ready() -> bool {
-    true
-}
-
-#[uniffi::export]
-pub async fn void_return() {}
-
-#[uniffi::export]
-pub async fn say() -> String {
-    Delay::new(Duration::from_secs(2)).await;
-    "Hello, Future!".to_string()
-}
-
-#[uniffi::export]
-pub async fn say_after(ms: u16, who: String) -> String {
-    Delay::new(Duration::from_millis(ms.into())).await;
-    format!("Hello, {who}!")
-}
-
-#[uniffi::export]
-pub async fn sleep(ms: u16) -> bool {
-    Delay::new(Duration::from_millis(ms.into())).await;
-    true
-}
-
-#[uniffi::export]
-pub async fn sleep_no_return(ms: u16) {
-    Delay::new(Duration::from_millis(ms.into())).await;
 }
 
 #[uniffi::export]
@@ -132,101 +94,6 @@ pub enum MyError {
     Foo,
 }
 
-#[uniffi::export]
-pub async fn fallible_me(do_fail: bool) -> Result<u8, MyError> {
-    if do_fail {
-        Err(MyError::Foo)
-    } else {
-        Ok(42)
-    }
-}
-
-#[uniffi::export]
-pub async fn fallible_struct(do_fail: bool) -> Result<Arc<Megaphone>, MyError> {
-    if do_fail {
-        Err(MyError::Foo)
-    } else {
-        Ok(new_megaphone())
-    }
-}
-
-#[uniffi::export]
-pub fn new_megaphone() -> Arc<Megaphone> {
-    Arc::new(Megaphone)
-}
-
-#[uniffi::export]
-pub async fn async_new_megaphone() -> Arc<Megaphone> {
-    new_megaphone()
-}
-
-#[uniffi::export]
-pub async fn async_maybe_new_megaphone(value: bool) -> Option<Arc<Megaphone>> {
-    value.then(new_megaphone)
-}
-
-#[uniffi::export]
-pub async fn say_after_with_megaphone(megaphone: Arc<Megaphone>, ms: u16, who: String) -> String {
-    megaphone.say_after(ms, who).await
-}
-
-#[derive(uniffi::Object)]
-pub struct Megaphone;
-
-#[uniffi::export]
-impl Megaphone {
-    #[uniffi::constructor]
-    pub async fn new() -> Arc<Self> {
-        Delay::new(Duration::from_millis(0)).await;
-        Arc::new(Self)
-    }
-
-    #[uniffi::constructor]
-    pub async fn secondary() -> Arc<Self> {
-        Delay::new(Duration::from_millis(0)).await;
-        Arc::new(Self)
-    }
-
-    pub async fn say_after(self: Arc<Self>, ms: u16, who: String) -> String {
-        say_after(ms, who).await.to_uppercase()
-    }
-
-    pub async fn silence(&self) -> String {
-        String::new()
-    }
-
-    pub async fn fallible_me(self: Arc<Self>, do_fail: bool) -> Result<u8, MyError> {
-        fallible_me(do_fail).await
-    }
-}
-
-#[derive(uniffi::Object)]
-pub struct FallibleMegaphone;
-
-#[uniffi::export]
-impl FallibleMegaphone {
-    #[uniffi::constructor]
-    pub async fn new() -> Result<Arc<Self>, MyError> {
-        Err(MyError::Foo)
-    }
-}
-
-pub struct UdlMegaphone;
-
-impl UdlMegaphone {
-    pub async fn new() -> Self {
-        Self
-    }
-
-    pub async fn secondary() -> Self {
-        Self
-    }
-
-    pub async fn say_after(self: Arc<Self>, ms: u16, who: String) -> String {
-        say_after(ms, who).await.to_uppercase()
-    }
-}
-
 #[derive(uniffi::Record)]
 pub struct MyRecord {
     pub a: String,
@@ -239,11 +106,6 @@ impl MyRecord {
         Delay::new(Duration::from_millis(ms.into())).await;
         self.b
     }
-}
-
-#[uniffi::export]
-pub async fn new_my_record(a: String, b: u32) -> MyRecord {
-    MyRecord { a, b }
 }
 
 #[derive(uniffi::Enum)]
@@ -262,23 +124,6 @@ impl ValidationMode {
     }
 }
 
-#[derive(uniffi::Record)]
-pub struct SharedResourceOptions {
-    pub release_after_ms: u16,
-    pub timeout_ms: u16,
-}
-
-#[derive(thiserror::Error, uniffi::Error, Debug)]
-pub enum AsyncError {
-    #[error("Timeout")]
-    Timeout,
-}
-
-#[uniffi::export(async_runtime = "tokio")]
-pub async fn use_shared_resource(options: SharedResourceOptions) -> Result<(), AsyncError> {
-    acquire_with_timeout(options).await
-}
-
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum AsyncParserError {
     #[error("invalid integer")]
@@ -295,28 +140,70 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for AsyncParserError {
 
 #[uniffi::export(with_foreign)]
 #[async_trait::async_trait]
-pub trait AsyncParser: Send + Sync {
+pub trait TestParser: Send + Sync {
     async fn stringify(&self, value: i32) -> String;
     async fn parse(&self, value: String) -> Result<i32, AsyncParserError>;
     async fn wait(&self);
 }
 
 #[uniffi::export]
-pub async fn stringify_using_parser(parser: Arc<dyn AsyncParser>, value: i32) -> String {
+pub async fn stringify_using_parser(parser: Arc<dyn TestParser>, value: i32) -> String {
     parser.stringify(value).await
 }
 
 #[uniffi::export]
 pub async fn parse_using_parser(
-    parser: Arc<dyn AsyncParser>,
+    parser: Arc<dyn TestParser>,
     value: String,
 ) -> Result<i32, AsyncParserError> {
     parser.parse(value).await
 }
 
 #[uniffi::export]
-pub async fn wait_using_parser(parser: Arc<dyn AsyncParser>) {
+pub async fn wait_using_parser(parser: Arc<dyn TestParser>) {
     parser.wait().await
 }
 
-uniffi::include_scaffolding!("async-calls");
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn stringify_on_tokio(parser: Arc<dyn TestParser>, value: i32) -> String {
+    let parent = std::thread::current().id();
+    tokio::spawn(async move {
+        assert_ne!(std::thread::current().id(), parent);
+        parser.stringify(value).await
+    })
+    .await
+    .expect("async parser task failed")
+}
+
+struct RustAsyncParser;
+
+#[async_trait::async_trait]
+impl TestParser for RustAsyncParser {
+    async fn stringify(&self, value: i32) -> String {
+        value.to_string()
+    }
+
+    async fn parse(&self, value: String) -> Result<i32, AsyncParserError> {
+        value.parse().map_err(|_| AsyncParserError::InvalidInteger)
+    }
+
+    async fn wait(&self) {}
+}
+
+#[uniffi::export]
+pub fn rust_async_parser() -> Arc<dyn TestParser> {
+    Arc::new(RustAsyncParser)
+}
+
+#[uniffi::export(callback_interface)]
+#[async_trait::async_trait]
+pub trait AsyncGreeter: Send + Sync {
+    async fn greeting(&self) -> String;
+}
+
+#[uniffi::export]
+pub async fn greet_with(greeter: Box<dyn AsyncGreeter>) -> String {
+    greeter.greeting().await
+}
+
+uniffi::setup_scaffolding!("async_calls");

@@ -143,7 +143,7 @@ impl CppCodeOracle {
     }
 
     pub(crate) fn fn_name(&self, nm: &str) -> String {
-        nm.to_string().to_snake_case()
+        self.var_name(nm)
     }
 
     pub(crate) fn var_name(&self, nm: &str) -> String {

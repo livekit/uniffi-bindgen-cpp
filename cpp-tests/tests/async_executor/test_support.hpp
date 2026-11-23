@@ -1,5 +1,6 @@
 #pragma once
 
+#include "async_calls.hpp"
 #include "futures.hpp"
 #include "test_common.hpp"
 

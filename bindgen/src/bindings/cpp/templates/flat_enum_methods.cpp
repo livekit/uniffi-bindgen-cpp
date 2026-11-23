@@ -1,5 +1,5 @@
 {%- for method in methods %}
-{% call macros::value_method_return_type(method) %} {{ method.name()|fn_name }}({{ type_name }} _uniffi_self{% if !method.arguments().is_empty() %}, {% endif %}{% call macros::param_list(method) %}) {
+{% call macros::callable_return_type(method) %} {{ method.name()|fn_name }}({{ type_name }} _uniffi_self{% if !method.arguments().is_empty() %}, {% endif %}{% call macros::param_list(method) %}) {
     {%- if method.is_async() %}
     return {% call macros::rust_call_async_with_value(method, typ, "_uniffi_self") %};
     {%- else %}

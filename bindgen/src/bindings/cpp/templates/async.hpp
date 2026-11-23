@@ -35,7 +35,7 @@ class AsyncExecutor {
 
     uint64_t track(AsyncTask cancel) {
         std::lock_guard<std::mutex> guard(mutex_);
-        if (!accepting_) {
+        if (!accepting_.load(std::memory_order_relaxed)) {
             return 0;
         }
         const auto id = ++next_id_;
@@ -46,19 +46,25 @@ class AsyncExecutor {
     void untrack(uint64_t id) noexcept {
         std::lock_guard<std::mutex> guard(mutex_);
         active_.erase(id);
-        drained_.notify_all();
+        if (!accepting()) {
+            drained_.notify_all();
+        }
     }
 
-    bool accepting() const {
-        std::lock_guard<std::mutex> guard(mutex_);
-        return accepting_;
-    }
+    bool accepting() const noexcept { return accepting_.load(std::memory_order_acquire); }
 
     bool is_worker() const noexcept { return current_worker_ == this; }
 
+    template <typename Call> void run_inline(Call call) noexcept {
+        const auto previous = current_inline_;
+        current_inline_ = this;
+        call();
+        current_inline_ = previous;
+    }
+
     void start() {
-        if (is_worker()) {
-            // Shutdown may be waiting for this worker to finish.
+        if (is_worker() || current_inline_ == this) {
+            // Shutdown may be waiting for this call to finish.
             return;
         }
         std::lock_guard<std::mutex> shutdown_guard(shutdown_mutex_);
@@ -66,12 +72,12 @@ class AsyncExecutor {
         if (stopped_) {
             worker_ = std::thread([this] { run(); });
             stopped_ = false;
-            accepting_ = true;
+            accepting_.store(true, std::memory_order_release);
         }
     }
 
     void shutdown() {
-        if (is_worker()) {
+        if (is_worker() || current_inline_ == this) {
             throw std::logic_error("UniFFI executor cannot shut down from its own callback");
         }
         std::lock_guard<std::mutex> shutdown_guard(shutdown_mutex_);
@@ -81,7 +87,7 @@ class AsyncExecutor {
             if (stopped_) {
                 return;
             }
-            accepting_ = false;
+            accepting_.store(false, std::memory_order_release);
             for (const auto &entry : active_) {
                 cancellations.push_back(entry.second);
             }
@@ -101,19 +107,18 @@ class AsyncExecutor {
   private:
     void run() noexcept {
         current_worker_ = this;
+        std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {
-            AsyncTask task;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                ready_.wait(lock, [this] { return !tasks_.empty() || stopped_; });
-                if (tasks_.empty()) {
-                    current_worker_ = nullptr;
-                    return;
-                }
-                task = std::move(tasks_.front());
-                tasks_.pop_front();
-                running_ = true;
+            ready_.wait(lock, [this] { return !tasks_.empty() || stopped_; });
+            if (tasks_.empty()) {
+                current_worker_ = nullptr;
+                return;
             }
+            auto task = std::move(tasks_.front());
+            tasks_.pop_front();
+            running_ = true;
+            lock.unlock();
+
             try {
                 task();
             } catch (...) {
@@ -121,11 +126,11 @@ class AsyncExecutor {
             }
             // Release captured objects before announcing that the executor has drained.
             task = {};
-            {
-                std::lock_guard<std::mutex> guard(mutex_);
-                running_ = false;
+            lock.lock();
+            running_ = false;
+            if (!accepting()) {
+                drained_.notify_all();
             }
-            drained_.notify_all();
         }
     }
 
@@ -136,10 +141,11 @@ class AsyncExecutor {
     std::deque<AsyncTask> tasks_;
     std::map<uint64_t, AsyncTask> active_;
     uint64_t next_id_ = 0;
-    bool accepting_ = true;
+    std::atomic<bool> accepting_{true};
     bool stopped_ = false;
     bool running_ = false;
     inline static thread_local const AsyncExecutor *current_worker_ = nullptr;
+    inline static thread_local const AsyncExecutor *current_inline_ = nullptr;
     std::thread worker_;
 };
 
@@ -166,6 +172,14 @@ inline void check_blocking_wait(bool ready) {
     }
 }
 
+template <typename T> struct ForeignFutureSuccess {
+    using Type = std::function<void(T)>;
+};
+
+template <> struct ForeignFutureSuccess<void> {
+    using Type = std::function<void()>;
+};
+
 } // namespace detail
 
 // Cancels in-flight calls, drains their Rust handles and queued completions, and joins the worker.
@@ -180,34 +194,7 @@ inline void start_async_executor() { detail::async_executor().start(); }
 template <typename T> class ForeignFuture {
   public:
     using Cancel = std::function<void()>;
-    using Success = std::function<void(T)>;
-    using Failure = std::function<void(std::exception_ptr)>;
-    using Start = std::function<Cancel(Success, Failure)>;
-
-    ForeignFuture() = default;
-    explicit ForeignFuture(Start start) : start_(std::move(start)) {}
-
-    ForeignFuture(const ForeignFuture &) = delete;
-    ForeignFuture &operator=(const ForeignFuture &) = delete;
-    ForeignFuture(ForeignFuture &&) noexcept = default;
-    ForeignFuture &operator=(ForeignFuture &&) noexcept = default;
-
-    Cancel start(Success success, Failure failure) && {
-        if (!start_) {
-            throw std::logic_error("UniFFI foreign future is invalid or has already been started");
-        }
-        auto start = std::move(start_);
-        return start(std::move(success), std::move(failure));
-    }
-
-  private:
-    Start start_;
-};
-
-template <> class ForeignFuture<void> {
-  public:
-    using Cancel = std::function<void()>;
-    using Success = std::function<void()>;
+    using Success = typename detail::ForeignFutureSuccess<T>::Type;
     using Failure = std::function<void(std::exception_ptr)>;
     using Start = std::function<Cancel(Success, Failure)>;
 
@@ -322,7 +309,6 @@ template <typename T> class FutureCompletionState {
     T get() {
         std::unique_lock<std::mutex> lock(mutex_);
         check_blocking_wait(result_.has_value());
-        claim_locked();
         ready_.wait(lock, [this] { return result_.has_value(); });
         auto result = std::move(*result_);
         lock.unlock();
@@ -352,7 +338,6 @@ template <typename T> class FutureCompletionState {
         bool ready;
         {
             std::lock_guard<std::mutex> guard(mutex_);
-            claim_locked();
             ready = result_.has_value();
             if (!ready) {
                 callback_ = std::move(callback);
@@ -363,13 +348,6 @@ template <typename T> class FutureCompletionState {
     }
 
   private:
-    void claim_locked() {
-        if (claimed_) {
-            throw std::logic_error("UniFFI future result has already been consumed");
-        }
-        claimed_ = true;
-    }
-
     void enqueue_continuation(Callback callback) noexcept {
         Result result = [&] {
             std::lock_guard<std::mutex> guard(mutex_);
@@ -391,19 +369,8 @@ template <typename T> class FutureCompletionState {
     mutable std::mutex mutex_;
     mutable std::condition_variable ready_;
     std::optional<Result> result_;
-    bool claimed_ = false;
     Callback callback_;
 };
-
-template <> inline void FutureCompletionState<void>::get() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    check_blocking_wait(result_.has_value());
-    claim_locked();
-    ready_.wait(lock, [this] { return result_.has_value(); });
-    auto result = std::move(*result_);
-    lock.unlock();
-    result.get();
-}
 
 } // namespace detail
 
@@ -448,6 +415,8 @@ class FutureContinuation {
     }
 
     ~FutureContinuation() { cancel(); }
+
+    void detach() noexcept { cancel_ = nullptr; }
 
     void cancel() noexcept {
         if (cancel_) {

@@ -56,8 +56,10 @@ void check_rust_call(const RustCallStatus &status, F error_cb) {
 
         throw std::runtime_error("A Rust panic has occurred");
 
+    {%- if ci.has_async_fns() %}
     case 3:
         throw ::uniffi::AsyncCancelledError();
+    {%- endif %}
     }
 
     throw std::runtime_error("Unexpected Rust call status");
@@ -80,7 +82,9 @@ R rust_call(F f, EF error_cb, Args... args) {
     }
 }
 
+{%- if ci.has_async_fns() %}
 {% include "async.cpp" %}
+{%- endif %}
 
 template <typename F, typename W>
 void rust_call_trait_interface(RustCallStatus* status, F make_call, W write_value) {

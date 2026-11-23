@@ -1,5 +1,5 @@
 {%- for method in methods %}
-{% call macros::value_method_return_type(method) %} {{ type_name }}::{{ method.name()|fn_name }}({% call macros::param_list(method) %}) const {
+{% call macros::callable_return_type(method) %} {{ type_name }}::{{ method.name()|fn_name }}({% call macros::param_list(method) %}) const {
     {%- if method.is_async() %}
     return {% call macros::rust_call_async_with_value(method, typ, "*this") %};
     {%- else %}
