@@ -58,6 +58,12 @@ function(runtime_test TEST_NAME)
 endfunction()
 
 runtime_test(async_executor_unit tests/async_executor_unit/peer.cpp)
+runtime_test(async_futures_unit)
+runtime_test(async_exit_from_continuation)
+set_tests_properties(async_exit_from_continuation-test PROPERTIES TIMEOUT 15)
+if(VALGRIND)
+    set_tests_properties(async_exit_from_continuation-test-test-memcheck PROPERTIES TIMEOUT 30)
+endif()
 
 # Add a bindings test case
 macro(test_case TEST_NAME)
